@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Pipeline outputs (large binary files)
+output/*.npy
+output/submission.csv
+output/submission_safe.csv
+output/results.csv
+
+# Don't ignore source CSVs only if small — but our data CSVs are large, ignore them
+playground-series-dataCSV/
+
+# Logs
+*.log
