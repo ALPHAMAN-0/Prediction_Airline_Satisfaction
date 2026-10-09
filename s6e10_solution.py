@@ -1163,19 +1163,72 @@ def _write_submission(probs, path):
         f"(min={sub['satisfaction'].min():.4f}, max={sub['satisfaction'].max():.4f})"
     )
 
-# Pick best by OOF AUC among stack / rank / hill
+# Pick the submission strategy. The 3 ensembles (stack, rank, hill) often
+# differ by < 0.0002 in OOF AUC -- below the fold-std noise floor (~0.0003).
+# In that regime, picking the "best" one is overfitting to OOF noise and is
+# not robust on the hidden test set. We use a simple rule:
+#   - if the spread between the best and worst ensemble is > ENSEMBLE_PICK_THRESHOLD
+#     (i.e. a real signal), use the single best one
+#   - otherwise, use the rank-average of all 3 ensembles (more robust)
+ENSEMBLE_PICK_THRESHOLD = 0.0005
 candidates = []
 for name, fname in (("stack", "stack"), ("rank_top3", "rank"), ("hill_climb", "hill")):
     p = os.path.join(OUT_DIR, f"oof_{fname}.npy")
-    if not os.path.exists(p): continue
+    if not os.path.exists(p):
+        continue
     o = np.load(p)
-    candidates.append((name, roc_auc_score(y, o),
-                       np.load(os.path.join(OUT_DIR, f"test_{fname}.npy"))))
-candidates.sort(key=lambda x: -x[1])
-print("Final candidates:", [(c[0], c[1]) for c in candidates])
-best_name, best_auc, best_test = candidates[0]
-_write_submission(best_test, os.path.join(OUT_DIR, "submission.csv"))
-# safe alternative: rank-avg of top-3 members
+    candidates.append((
+        name,
+        roc_auc_score(y, o),
+        o,
+        np.load(os.path.join(OUT_DIR, f"test_{fname}.npy")),
+    ))
+
+if not candidates:
+    print("WARNING: no ensemble OOFs found; falling back to last base learner.")
+    best_test = TESTS[-1]
+    best_auc = float("nan")
+    best_name = "fallback"
+else:
+    candidates.sort(key=lambda x: -x[1])
+    print(
+        "Final candidates:",
+        [(c[0], round(c[1], 6)) for c in candidates],
+    )
+    best_name, best_auc, best_oof, best_test = candidates[0]
+    spread = candidates[0][1] - candidates[-1][1]
+    if spread > ENSEMBLE_PICK_THRESHOLD:
+        # Real signal: pick the best ensemble.
+        print(
+            f"  spread={spread:.6f} > {ENSEMBLE_PICK_THRESHOLD}: "
+            f"using single best ({best_name})"
+        )
+    else:
+        # Noise regime: rank-average all 3 ensembles for robustness.
+        print(
+            f"  spread={spread:.6f} <= {ENSEMBLE_PICK_THRESHOLD}: "
+            f"rank-averaging {len(candidates)} ensembles for robustness"
+        )
+        all_oof  = np.column_stack([c[2] for c in candidates])
+        all_test = np.column_stack([c[3] for c in candidates])
+        # logit-space mean is more robust than rank-mean for binary AUC,
+        # but rank-mean is rank-invariant so safe under any monotonic transform.
+        def _rank01(a):
+            return np.argsort(np.argsort(a)) / (len(a) - 1)
+        best_test = np.mean(
+            [_rank01(all_test[:, j]) for j in range(all_test.shape[1])],
+            axis=0,
+        )
+        # OOF AUC for logging
+        best_oof_rank = np.mean(
+            [_rank01(all_oof[:, j]) for j in range(all_oof.shape[1])],
+            axis=0,
+        )
+        best_auc = roc_auc_score(y, best_oof_rank)
+        best_name = "ensemble_rank_avg"
+    _write_submission(best_test, os.path.join(OUT_DIR, "submission.csv"))
+
+# safe alternative: rank-avg of top-3 base learners (most diverse single-models)
 if len(OOFS) >= 3:
     aucs = [roc_auc_score(y, o) for o in OOFS]
     order = np.argsort(aucs)[::-1][:3]
