@@ -31,11 +31,12 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 | 0 (sanity) | `lgbm_raw` (raw features only) | 0.958810 | — | — | 0.000064 |
 | 1 (B) | `lgbm_full` (route features) | **0.960421** | **+0.001611** | — | 0.000064 |
 | 2 (C) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960685 (blend) | 0.000064 |
-| 3 (D) | `lgbm_full` (still champion) | 0.960421 | 0 | **0.960739** (blend) | 0.000064 |
+| 3 (D) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960739 (blend) | 0.000064 |
+| 4 (E1) | `lgbm_full` (still champion) | 0.960421 | 0 | **0.960741** (blend) | 0.000064 |
 
-We're at **0.960739** in the blend, which clears the 0.9605 goal. Single
-model is at 0.960421 (just below 0.9605); the next model-variety round
-(E) should close the gap on its own.
+`xgb_full_d` is REJECTED (0.9559; XGB hit `best_iter=3999` max with
+lr=0.05; didn't converge). Including it in the stack HURT the blend
+(0.960739 → 0.960721), so the official `best.csv` is the 4-LGBM blend.
 
 ## STEP 0 diagnostics
 
@@ -122,10 +123,10 @@ predictor (3.5× the second-place).
 
 ## Next 3 ideas
 
-1. **exp_E_xgb**: XGBoost on the route-enriched features. Adds a
-   non-LGBM member to the blend (highest-leverage single change for
-   ensemble diversity). CPU-bound: ~3-5 min per fold.
-2. **exp_E_cat**: CatBoost on the route-enriched features. CPU is
+1. **exp_E1b_xgb_lr0.02**: XGBoost with `lr=0.02` and `max_depth=6`
+   (longer training, more trees). The first XGB hit `best_iter=3999`
+   (max); it needs more iterations and shallower trees to converge.
+2. **exp_E2_cat**: CatBoost on the route-enriched features. CPU is
    5-10× slower than LGBM; will run a depth-4 variant first.
 3. **exp_F_optuna**: Optuna search (≤40 trials) on the champion LGBM
    hyperparameters. May find a +0.0001-0.0003 improvement.
