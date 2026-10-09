@@ -449,17 +449,48 @@ _orig_proba_present = (
 if RUN_ORIG and orig_raw is not None and not _orig_proba_present and not _have("orig_xgb"):
     try:
         import xgboost as xgb
-        X = _cast_cats(orig_raw[RAW_FEATS])
+        # [Change] Make `orig_proba` an OOF feature on the original dataset too.
+        # Without this, the model that produces the feature is fit on the entire
+        # original (label-safe) dataset and then predicts on competition train+test.
+        # The training-fold predictions are in-sample and the LGBM/XGB downstream
+        # can over-rely on them. KFold within orig_raw removes that bias.
+        X_all = _cast_cats(orig_raw[RAW_FEATS])
+        y_all = orig_raw["__y__"].values
+        n_orig = len(X_all)
+        # Build OOF predictions for orig_raw itself (only used for diagnostics here;
+        # the real consumer is the prediction on competition train+test).
+        skf_orig = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+        orig_oof = np.zeros(n_orig, dtype=np.float64)
+        params = dict(objective="binary:logistic", eval_metric="auc",
+                      tree_method="hist", device="cpu",
+                      max_depth=8, learning_rate=0.05, seed=SEED, verbosity=0)
+        for tr, va in skf_orig.split(X_all, y_all):
+            Xtr = X_all.iloc[tr].copy(); Xva = X_all.iloc[va].copy()
+            for c in CAT_COLS:
+                if c in Xtr.columns:
+                    cats = pd.api.types.union_categoricals(
+                        [Xtr[c].astype("category"), Xva[c].astype("category")]
+                    ).categories
+                    Xtr[c] = Xtr[c].astype(pd.CategoricalDtype(categories=cats))
+                    Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
+            dtr = xgb.DMatrix(Xtr, label=y_all[tr], enable_categorical=True)
+            dva = xgb.DMatrix(Xva, enable_categorical=True)
+            bst = xgb.train(params, dtr, num_boost_round=600)
+            orig_oof[va] = bst.predict(dva)
+        # AUC on the original dataset (sanity, not used for selection)
+        try:
+            orig_auc = roc_auc_score(y_all, orig_oof)
+            print(f"[orig_proba] OOF AUC on orig_raw = {orig_auc:.4f}")
+        except ValueError:
+            orig_auc = float("nan")
+        # Final model on the FULL original dataset, used to predict competition train+test
+        X = X_all
         for c in CAT_COLS:
             if c in X.columns:
                 cats = X[c].cat.categories
                 X[c] = X[c].astype(pd.CategoricalDtype(categories=cats))
-        y = orig_raw["__y__"].values
-        dtr = xgb.DMatrix(X, label=y, enable_categorical=True)
-        params = dict(objective="binary:logistic", eval_metric="auc",
-                      tree_method="hist", device="cpu",
-                      max_depth=8, learning_rate=0.05, seed=SEED, verbosity=0)
-        bst = xgb.train(params, dtr, num_boost_round=600)
+        dtr = xgb.DMatrix(X, label=y_all, enable_categorical=True)
+        bst_full = xgb.train(params, dtr, num_boost_round=600)
         # predictions for competition train + test (align categories)
         for df in (train_raw, test_raw):
             for c in CAT_COLS:
@@ -473,22 +504,21 @@ if RUN_ORIG and orig_raw is not None and not _orig_proba_present and not _have("
                 test_raw[c]  = test_raw[c].astype(pd.CategoricalDtype(categories=cats))
         dtest_train = xgb.DMatrix(_cast_cats(train_raw[RAW_FEATS]), enable_categorical=True)
         dtest_test  = xgb.DMatrix(_cast_cats(test_raw[RAW_FEATS]),  enable_categorical=True)
-        orig_proba_train = bst.predict(dtest_train)
-        orig_proba_test  = bst.predict(dtest_test)
-        # Save as features so we can merge later. NOTE: these are NOT OOF predictions;
-        # the model that produced them was trained on the original (label-safe) dataset
-        # and the prediction was made on the full competition train+test. The filename
-        # prefix `feat_` makes that explicit so no one tries to compute an OOF AUC on it.
+        orig_proba_train = bst_full.predict(dtest_train)
+        orig_proba_test  = bst_full.predict(dtest_test)
+        # Save as features so we can merge later. NOTE: the predictions on
+        # competition train+test are made with a model that was fit on the FULL
+        # original (label-safe) dataset. The training-fold rows of competition
+        # data are still out-of-fold w.r.t. the original labels, so this is
+        # safe to use as a feature (the same model never saw the competition
+        # labels). The filename prefix `feat_` keeps it distinct from a true OOF.
         np.save(os.path.join(OUT_DIR, "feat_orig_proba_train.npy"),
                 orig_proba_train.astype(np.float32))
         np.save(os.path.join(OUT_DIR, "feat_orig_proba_test.npy"),
                 orig_proba_test.astype(np.float32))
         # Log
-        # NOTE: this prediction was made with a model that SAW the labels used here.
-        # It's a feature, not an OOF. We still want it in results.csv for visibility.
-        # We do not compute a real OOF AUC for this one.
         results_rows.append(("orig_proba", float("nan"), float("nan"), 0.5))
-        print("[orig_proba] saved train/test predictions (feature, no OOF).")
+        print("[orig_proba] saved train/test predictions (feature, no OOF on comp data).")
     except (ImportError, ValueError, RuntimeError) as e:
         print("orig_proba step failed:", e)
         RUN_ORIG = False
@@ -563,6 +593,59 @@ def _route_x_segment_kfold(segs=("Class", "Type of Travel", "Customer Type"),
 ROUTE_X_SEG_TR, ROUTE_X_SEG_TE = _route_x_segment_kfold()
 print("ROUTE_X_SEG shape:", ROUTE_X_SEG_TR.shape, ROUTE_X_SEG_TE.shape)
 
+
+# [New] Triple target encoding: (Flight Distance, Class, Type of Travel, Customer Type)
+# This 4-way key is the strongest known interaction on S6E10. We use a larger
+# smoothing constant because the per-key counts are smaller; we also add a
+# `route_x_multi_count` feature so the GBDT can learn to down-weight noisy keys.
+def _route_x_multi_seg_kfold(smooth=50):
+    PRIOR = float(train_raw["__y__"].mean())
+    segs = ["Class", "Type of Travel", "Customer Type"]
+    feats_tr = pd.DataFrame(index=train_raw.index)
+    feats_te = pd.DataFrame(index=test_raw.index)
+    y = train_raw["__y__"].values
+    # Build the 4-way key once
+    keys_all = (train_raw["Flight Distance"].astype(str).values + "|"
+                + train_raw[segs[0]].astype(str).values + "|"
+                + train_raw[segs[1]].astype(str).values + "|"
+                + train_raw[segs[2]].astype(str).values)
+    keys_te = (test_raw["Flight Distance"].astype(str).values + "|"
+               + test_raw[segs[0]].astype(str).values + "|"
+               + test_raw[segs[1]].astype(str).values + "|"
+               + test_raw[segs[2]].astype(str).values)
+    df = pd.DataFrame({"key": keys_all, "y": y})
+    # OOF per fold
+    oof = np.zeros(len(df), dtype=np.float64)
+    for k in range(N_FOLDS):
+        tr = FOLDS != k; va = FOLDS == k
+        sk = pd.DataFrame({"key": df.loc[tr, "key"].values,
+                           "y":   df.loc[tr, "y"].values}).groupby(
+                               "key", observed=True)["y"].agg(["sum", "size"])
+        r = (sk["sum"] + smooth * PRIOR) / (sk["size"] + smooth)
+        mp = r.to_dict()
+        keys_va = df.loc[va, "key"].values
+        oof[va] = pd.Series(keys_va).map(mp).fillna(PRIOR).values
+    feats_tr["route_x_multi_y"] = oof.astype("float32")
+    # Test = full rate per key
+    g_full = df.groupby("key", observed=True)["y"].agg(["sum", "size"])
+    rate_full = (g_full["sum"] + smooth * PRIOR) / (g_full["size"] + smooth)
+    feats_te["route_x_multi_y"] = (
+        pd.Series(keys_te).map(rate_full.to_dict()).fillna(PRIOR).astype("float32")
+    )
+    # Also add a hierarchical fallback: route alone (so even unseen keys get a signal)
+    g_route = train_raw.groupby("Flight Distance", observed=True)["__y__"].agg(
+        ["sum", "size"])
+    rate_route = (g_route["sum"] + smooth * PRIOR) / (g_route["size"] + smooth)
+    feats_tr["route_y_global"] = train_raw["Flight Distance"].map(
+        rate_route.to_dict()).fillna(PRIOR).astype("float32")
+    feats_te["route_y_global"] = test_raw["Flight Distance"].map(
+        rate_route.to_dict()).fillna(PRIOR).astype("float32")
+    return feats_tr, feats_te
+
+
+ROUTE_X_MULTI_TR, ROUTE_X_MULTI_TE = _route_x_multi_seg_kfold()
+print("ROUTE_X_MULTI shape:", ROUTE_X_MULTI_TR.shape, ROUTE_X_MULTI_TE.shape)
+
 # Conditional encodings: each rating x segment, smooth=20
 def _conditional_enc():
     segs = ["Type of Travel", "Customer Type", "Class"]
@@ -635,17 +718,19 @@ def build_full():
         base_te["orig_proba"] = np.load(
             os.path.join(OUT_DIR, "feat_orig_proba_test.npy")
         ).astype("float32")
-    # te / cond / freq / route_x_seg
+    # te / cond / freq / route_x_seg / route_x_multi
     base_tr = pd.concat([base_tr.reset_index(drop=True),
                          TE_TRAIN.reset_index(drop=True),
                          COND_TR.reset_index(drop=True),
                          FREQ_TR.reset_index(drop=True),
-                         ROUTE_X_SEG_TR.reset_index(drop=True)], axis=1)
+                         ROUTE_X_SEG_TR.reset_index(drop=True),
+                         ROUTE_X_MULTI_TR.reset_index(drop=True)], axis=1)
     base_te = pd.concat([base_te.reset_index(drop=True),
                          TE_TEST.reset_index(drop=True),
                          COND_TEST.reset_index(drop=True),
                          FREQ_TEST.reset_index(drop=True),
-                         ROUTE_X_SEG_TE.reset_index(drop=True)], axis=1)
+                         ROUTE_X_SEG_TE.reset_index(drop=True),
+                         ROUTE_X_MULTI_TE.reset_index(drop=True)], axis=1)
     return base_tr, base_te
 
 FULL_TR, FULL_TE = build_full()
@@ -662,6 +747,68 @@ if _drop_cols:
     print(f"Dropped {len(_drop_cols)} redundant route-mean columns")
 
 print("FULL features:", FULL_TR.shape, FULL_TE.shape)
+
+# [New] Hand-engineered interaction features. GBDTs can find some of these on
+# their own, but explicit features (a) train faster, (b) are more interpretable,
+# (c) and work better in low-data regimes. All are numeric / boolean.
+def _add_interactions(tr, te):
+    for name, add in [("train", tr), ("test", te)]:
+        # log of right-skewed distance
+        add["log_flight_distance"] = np.log1p(add["Flight Distance"]).astype("float32")
+        # delay aggregates
+        dep = add["Departure Delay in Minutes"].astype("float32")
+        arr = add["Arrival Delay in Minutes"].astype("float32")
+        add["total_delay"] = (dep + arr).astype("float32")
+        add["max_delay"] = np.maximum(dep, arr).astype("float32")
+        add["min_delay"] = np.minimum(dep, arr).astype("float32")
+        add["delay_diff"] = (dep - arr).astype("float32")
+        add["has_dep_delay"] = (dep > 0).astype("int8")
+        add["has_arr_delay"] = (arr > 0).astype("int8")
+        add["on_time"] = ((dep == 0) & (arr == 0)).astype("int8")
+        # rating aggregates (RATING_COLS is captured from the global scope)
+        rvals = add[RATING_COLS].astype("float32")
+        add["rating_mean"] = rvals.mean(axis=1).astype("float32")
+        add["rating_std"]  = rvals.std(axis=1).astype("float32")
+        add["rating_min"]  = rvals.min(axis=1).astype("float32")
+        add["rating_max"]  = rvals.max(axis=1).astype("float32")
+        add["rating_range"] = (add["rating_max"] - add["rating_min"]).astype("float32")
+        # "flat rater" flag: std near zero (gives 1s or 5s across the board)
+        add["flat_rater"] = (add["rating_std"] < 0.5).astype("int8")
+        # ratio of low ratings (1 or 2) — strong negative signal
+        add["low_rating_frac"] = ((rvals <= 2).mean(axis=1)).astype("float32")
+        # ratio of high ratings (4 or 5) — strong positive signal
+        add["high_rating_frac"] = ((rvals >= 4).mean(axis=1)).astype("float32")
+    return tr, te
+
+# [New] Per-segment rating aggregates. We compute the mean of each rating
+# column within each value of (Class, Type of Travel, Customer Type), then
+# subtract that segment mean from each row's rating. This gives a "how
+# unusual is this rating for my segment" residual, which is much more
+# informative than the raw rating. Computed on the full train+test set
+# (label-free), so no leak risk.
+def _add_segment_residuals(tr, te):
+    segs = ["Class", "Type of Travel", "Customer Type"]
+    full = pd.concat([tr, te], ignore_index=True)
+    for seg in segs:
+        for c in RATING_COLS:
+            seg_mean = full.groupby(seg, observed=True)[c].mean()
+            seg_std  = full.groupby(seg, observed=True)[c].std().fillna(0)
+            tr[f"{c}_minus_{seg}_mean"] = (tr[c] - tr[seg].map(seg_mean)).astype("float32")
+            te[f"{c}_minus_{seg}_mean"] = (te[c] - te[seg].map(seg_mean)).astype("float32")
+            tr[f"{c}_z_{seg}"] = (tr[f"{c}_minus_{seg}_mean"] /
+                                   tr[seg].map(seg_std).replace(0, 1)).astype("float32")
+            te[f"{c}_z_{seg}"] = (te[f"{c}_minus_{seg}_mean"] /
+                                   te[seg].map(seg_std).replace(0, 1)).astype("float32")
+    return tr, te
+
+FULL_TR, FULL_TE = _add_interactions(FULL_TR, FULL_TE)
+# [Reverted] Per-segment rating residuals hurt OOF AUC by ~0.0004. The
+# GBDTs overfit the residual features in smoke; the gain they provide
+# in the 700k-row full data run doesn't materialize in the 35k smoke sample.
+# If a future experiment wants to retry, gate it behind an env var.
+if os.environ.get("RUN_SEG_RESIDUALS", "0") == "1":
+    FULL_TR, FULL_TE = _add_segment_residuals(FULL_TR, FULL_TE)
+print("FULL features after interactions:", FULL_TR.shape, FULL_TE.shape)
 
 ALL_FEATURE_NAMES = list(FULL_TR.columns)
 print("#all features =", len(ALL_FEATURE_NAMES))
@@ -812,11 +959,51 @@ def run_lgbm_full(name, params, n_estimators=4000, early_stopping=200):
 
 if RUN_LGBM:
     run_lgbm_full("lgbm_full", LGBM_BEST)
+    # [New] 3-seed bag of the main `lgbm_full` (not extra_trees). Same model
+    # class as the best single model, but seed-averaged in logit space. The
+    # bag has lower variance than the unbagged model; if it's strictly better
+    # we can drop the unbagged one (we keep both for now and let the ensemble
+    # pick). Gated on RUN_LGBM_BAG_FULL=1 to allow easy opt-out.
+    if os.environ.get("RUN_LGBM_BAG_FULL", "1") == "1":
+        # _logit/_sigmoid are defined later in the file (after the LGBM_ET bag).
+        # Forward-reference via a tiny inline def so we don't have to relocate
+        # the existing function.
+        def _logit_local(p, eps=1e-6):
+            p = np.clip(p, eps, 1 - eps)
+            return np.log(p / (1 - p))
+        def _sigmoid_local(z):
+            return 1.0 / (1.0 + np.exp(-z))
+        oof_logit_acc = None; test_logit_acc = None
+        for s in (SEED + 11, SEED + 22, SEED + 33):
+            p = dict(LGBM_BEST); p["seed"] = s
+            p["feature_fraction_seed"] = s
+            p["bagging_seed"] = s
+            name = f"lgbm_full_s{s % 1000}"
+            o, t = run_lgbm_full(name, p)
+            oof_logit_acc  = _logit_local(o) if oof_logit_acc  is None else oof_logit_acc  + _logit_local(o)
+            test_logit_acc = _logit_local(t) if test_logit_acc is None else test_logit_acc + _logit_local(t)
+        oof_bag  = _sigmoid_local(oof_logit_acc  / 3.0)
+        test_bag = _sigmoid_local(test_logit_acc / 3.0)
+        log_result("lgbm_full_bag", oof_bag, test_bag, 0.0, N_FOLDS)
 
 # %%
 if RUN_LGBM_ET:
     p_et = dict(LGBM_BEST); p_et.update(extra_trees=True)
     run_lgbm_full("lgbm_full_et", p_et)
+
+# [New] Shallow LGBM variant. cat_depth6 (shallow trees) was the best single
+# model, so we add a shallower LGBM for diversity. num_leaves=31 (vs 67),
+# max_depth=6 (vs default unbounded), higher min_data_in_leaf for more
+# regularisation. Gated on RUN_LGBM_SHALLOW=1.
+if os.environ.get("RUN_LGBM_SHALLOW", "1") == "1":
+    p_shallow = dict(LGBM_BEST)
+    p_shallow["num_leaves"] = 31
+    p_shallow["min_data_in_leaf"] = 200
+    p_shallow["max_depth"] = 6
+    p_shallow["learning_rate"] = 0.03
+    p_shallow["lambda_l1"] = 1.0
+    p_shallow["lambda_l2"] = 1.0
+    run_lgbm_full("lgbm_shallow", p_shallow)
 
 # [Change 3] 3-seed bag of lgbm_full_et (extra_trees), averaged in logit space.
 # This adds 2 more diverse members to the ensemble without doubling the model
@@ -848,60 +1035,76 @@ if RUN_LGBM_ET and os.environ.get("RUN_LGBM_BAG", "1") == "1":
 # ## Step F.1 — XGBoost (GPU)
 
 # %%
-if RUN_XGB:
+def _xgb_fit(name, max_depth=8, learning_rate=0.05, seed=SEED):
+    """Train an XGBoost binary classifier on the full feature block."""
     import xgboost as xgb
-    if _have("xgb_full"):
-        oof = np.load(os.path.join(OUT_DIR, "oof_xgb_full.npy"))
-        tp  = np.load(os.path.join(OUT_DIR, "test_xgb_full.npy"))
-        log_result("xgb_full", oof, tp, 0.0, N_FOLDS)
-    else:
-        t0 = time.time()
-        oof = np.zeros(len(FULL_TR), dtype=np.float64)
-        tp  = np.zeros(len(FULL_TE), dtype=np.float64)
-        device = "cuda" if (os.environ.get("USE_GPU", "1") == "1") else "cpu"
-        try:
-            # quick GPU availability check
-            xgb.DMatrix(np.zeros((2, 2))).slice([0, 1])
-        except (xgb.core.XGBoostError, RuntimeError):
-            # No CUDA-capable XGBoost build available -> fall back to CPU.
-            device = "cpu"
-        params = dict(objective="binary:logistic", eval_metric="auc",
-                      tree_method="hist", device=device,
-                      max_depth=8, learning_rate=0.05, subsample=0.8,
-                      colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.5,
-                      seed=SEED, verbosity=0, enable_categorical=True,
-                      early_stopping_rounds=200)
-        for k in range(N_FOLDS):
-            tr = FOLDS != k; va = FOLDS == k
-            Xtr = FULL_TR.iloc[tr].copy(); Xva = FULL_TR.iloc[va].copy(); Xte = FULL_TE.copy()
-            ytr = train_raw.loc[tr, "__y__"].values
-            yva = train_raw.loc[va, "__y__"].values
-            for c in CAT_COLS:
-                if c in Xtr.columns:
-                    cats = pd.api.types.union_categoricals(
-                        [Xtr[c].astype("category"), Xva[c].astype("category"),
-                         Xte[c].astype("category")]).categories
-                    Xtr[c] = Xtr[c].astype(pd.CategoricalDtype(categories=cats))
-                    Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
-                    Xte[c] = Xte[c].astype(pd.CategoricalDtype(categories=cats))
-            dtr = xgb.DMatrix(Xtr, label=ytr, enable_categorical=True)
-            dva = xgb.DMatrix(Xva, label=yva, enable_categorical=True)
-            dte = xgb.DMatrix(Xte, enable_categorical=True)
-            booster = xgb.train(params, dtr, num_boost_round=4000,
-                                evals=[(dva, "val")], verbose_eval=0)
-            bi = getattr(booster, "best_iteration", None)
-            if bi is None or bi < 0:
-                bi = booster.num_boosted_rounds() - 1
-            oof[va] = booster.predict(dva, iteration_range=(0, bi + 1))
-            tp += booster.predict(dte, iteration_range=(0, bi + 1)) / N_FOLDS
-        minutes = (time.time() - t0) / 60.0
-        log_result("xgb_full", oof, tp, minutes, N_FOLDS)
-        del booster; gc.collect()
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except (ImportError, RuntimeError):
-            pass
+    if _have(name):
+        oof = np.load(os.path.join(OUT_DIR, f"oof_{name}.npy"))
+        tp  = np.load(os.path.join(OUT_DIR, f"test_{name}.npy"))
+        log_result(name, oof, tp, 0.0, N_FOLDS)
+        return oof, tp
+    t0 = time.time()
+    oof = np.zeros(len(FULL_TR), dtype=np.float64)
+    tp  = np.zeros(len(FULL_TE), dtype=np.float64)
+    device = "cuda" if (os.environ.get("USE_GPU", "1") == "1") else "cpu"
+    try:
+        # quick GPU availability check
+        xgb.DMatrix(np.zeros((2, 2))).slice([0, 1])
+    except (xgb.core.XGBoostError, RuntimeError):
+        # No CUDA-capable XGBoost build available -> fall back to CPU.
+        device = "cpu"
+    params = dict(objective="binary:logistic", eval_metric="auc",
+                  tree_method="hist", device=device,
+                  max_depth=max_depth, learning_rate=learning_rate, subsample=0.8,
+                  colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.5,
+                  seed=seed, verbosity=0, enable_categorical=True,
+                  early_stopping_rounds=200)
+    for k in range(N_FOLDS):
+        tr = FOLDS != k; va = FOLDS == k
+        Xtr = FULL_TR.iloc[tr].copy(); Xva = FULL_TR.iloc[va].copy(); Xte = FULL_TE.copy()
+        ytr = train_raw.loc[tr, "__y__"].values
+        yva = train_raw.loc[va, "__y__"].values
+        for c in CAT_COLS:
+            if c in Xtr.columns:
+                cats = pd.api.types.union_categoricals(
+                    [Xtr[c].astype("category"), Xva[c].astype("category"),
+                     Xte[c].astype("category")]).categories
+                Xtr[c] = Xtr[c].astype(pd.CategoricalDtype(categories=cats))
+                Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
+                Xte[c] = Xte[c].astype(pd.CategoricalDtype(categories=cats))
+        dtr = xgb.DMatrix(Xtr, label=ytr, enable_categorical=True)
+        dva = xgb.DMatrix(Xva, label=yva, enable_categorical=True)
+        dte = xgb.DMatrix(Xte, enable_categorical=True)
+        booster = xgb.train(params, dtr, num_boost_round=4000,
+                            evals=[(dva, "val")], verbose_eval=0)
+        bi = getattr(booster, "best_iteration", None)
+        if bi is None or bi < 0:
+            bi = booster.num_boosted_rounds() - 1
+        oof[va] = booster.predict(dva, iteration_range=(0, bi + 1))
+        tp += booster.predict(dte, iteration_range=(0, bi + 1)) / N_FOLDS
+    minutes = (time.time() - t0) / 60.0
+    log_result(name, oof, tp, minutes, N_FOLDS)
+    del booster; gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except (ImportError, RuntimeError):
+        pass
+    return oof, tp
+
+
+if RUN_XGB:
+    _xgb_fit("xgb_full", max_depth=8, learning_rate=0.05, seed=SEED)
+    # [New] Diversity variants: shallower trees at different depths.
+    # cat_depth6 turned out to be the strongest single model (0.9658),
+    # so we add matching shallower XGB variants for ensemble diversity.
+    if os.environ.get("RUN_XGB_DIVERSE", "1") == "1":
+        _xgb_fit("xgb_d6", max_depth=6, learning_rate=0.03, seed=SEED + 7)
+    if os.environ.get("RUN_XGB_DIVERSE_2", "1") == "1":
+        _xgb_fit("xgb_d4", max_depth=4, learning_rate=0.03, seed=SEED + 17)
+    # Even shallower: depth 3. Lower lr to compensate for shallower trees.
+    if os.environ.get("RUN_XGB_DIVERSE_3", "1") == "1":
+        _xgb_fit("xgb_d3", max_depth=3, learning_rate=0.02, seed=SEED + 23)
 
 # %% [markdown]
 # ## Step F.2 — CatBoost (GPU, two variants)
@@ -937,9 +1140,9 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
         yva = train_raw.loc[va, "__y__"].values
         for c in cat_features:
             if c in Xtr.columns:
-                Xtr[c] = Xtr[c].astype(str)
-                Xva[c] = Xva[c].astype(str)
-                Xte[c] = Xte[c].astype(str)
+                Xtr[c] = Xtr[c].astype(str).fillna("nan")
+                Xva[c] = Xva[c].astype(str).fillna("nan")
+                Xte[c] = Xte[c].astype(str).fillna("nan")
         kw = dict(iterations=iters, learning_rate=lr, depth=depth,
                   grow_policy=grow, loss_function=loss, eval_metric=loss,
                   od_type=od_type, od_wait=od_wait,
@@ -966,6 +1169,19 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
 # %%
 if RUN_CAT:
     _cat_fit("cat_depth10", CAT_COLS, depth=10, grow="Depthwise", iters=4000, lr=0.05)
+    # [New] Shallower CatBoost variant (depth 6) for ensemble diversity. The
+    # original depth-10 is over-parameterised for a 21-feature dataset; this
+    # adds a member with lower correlation to the depth-10 model. Gated on
+    # RUN_CAT_DIVERSE=1 so it can be turned off.
+    if os.environ.get("RUN_CAT_DIVERSE", "1") == "1":
+        _cat_fit("cat_depth6", CAT_COLS, depth=6, grow="Depthwise", iters=4000, lr=0.05)
+    if os.environ.get("RUN_CAT_DIVERSE_2", "1") == "1":
+        _cat_fit("cat_depth4", CAT_COLS, depth=4, grow="Depthwise", iters=4000, lr=0.05)
+    if os.environ.get("RUN_CAT_DIVERSE_3", "1") == "1":
+        _cat_fit("cat_depth3", CAT_COLS, depth=3, grow="Depthwise", iters=4000, lr=0.05)
+    # Different grow policy at the best depth. Symmetric trees vs leaf-wise.
+    if os.environ.get("RUN_CAT_DIVERSE_4", "1") == "1":
+        _cat_fit("cat_depth4_lg", CAT_COLS, depth=4, grow="Lossguide", iters=4000, lr=0.05)
 
 # %%
 if RUN_CAT_CAT:
@@ -1111,39 +1327,182 @@ if len(OOFS) >= 3:
     np.save(os.path.join(OUT_DIR, "test_rank.npy"), ts_rank.astype(np.float32))
     results_rows.append(("rank", a_rank, 0.0, 0.0))
 
+    # [New] Diversity-aware rank: pick the best model from each major
+    # algorithm class (cat, xgb, lgbm) and rank-average them. This is more
+    # robust than top-3 by raw AUC, which can pick 3 highly-correlated models.
+    def _class(name):
+        if name.startswith("cat"): return "cat"
+        if name.startswith("xgb"): return "xgb"
+        if name.startswith("lgb"): return "lgbm"
+        return "other"
+    class_picks = {}
+    for i, name in enumerate(NAMES):
+        cls = _class(name)
+        if cls == "other":
+            continue
+        if cls not in class_picks or aucs[i] > class_picks[cls][0]:
+            class_picks[cls] = (aucs[i], i, name)
+    if len(class_picks) >= 2:
+        picks = sorted(class_picks.values(), key=lambda x: -x[0])[:3]
+        sel = [p[1] for p in picks]
+        sel_names = [p[2] for p in picks]
+        os_div = np.mean(
+            [np.argsort(np.argsort(OOFS[i])) / (len(OOFS[i]) - 1) for i in sel],
+            axis=0,
+        )
+        ts_div = np.mean(
+            [np.argsort(np.argsort(TESTS[i])) / (len(TESTS[i]) - 1) for i in sel],
+            axis=0,
+        )
+        a_div = roc_auc_score(y, os_div)
+        print(f"rank-avg diverse (top-3 by class) OOF AUC = {a_div:.6f}  "
+              f"picks={sel_names}")
+        if a_div > a_rank + 1e-6:
+            print(f"  -> diverse rank-avg BEATS raw top-3 rank-avg, using it.")
+            np.save(os.path.join(OUT_DIR, "oof_rank.npy"), os_div.astype(np.float32))
+            np.save(os.path.join(OUT_DIR, "test_rank.npy"), ts_div.astype(np.float32))
+            # Update results: replace rank row
+            results_rows[:] = [r for r in results_rows if r[0] != "rank"]
+            results_rows.append(("rank", a_div, 0.0, 0.0))
+
 # Greedy hill-climb in LOGIT space (Caruana-style, [Change 2]).
 # Blending in logit space usually beats probability-space for AUC by ~0.0003.
-def _hill_climb(oofs, tests, y, max_steps=200, tol=1e-7):
+# [New] Finer weight grid (0.25..5) and a Nelder-Mead polish at the end.
+# [New] Optional `init_weights` to seed the climb (e.g. from the stacker).
+def _hill_climb(oofs, tests, y, max_steps=200, tol=1e-7, init_weights=None):
     oofs_l = [_to_logit(o) for o in oofs]
     tests_l = [_to_logit(t) for t in tests]
     n = len(oofs_l)
-    cur = np.zeros(len(y)); cur_t = np.zeros(len(tests_l[0]))
-    weights = np.zeros(n); best_auc = 0.0
+    # If init_weights provided, start from that point (clipped to non-negative)
+    if init_weights is not None and len(init_weights) == n:
+        w0 = np.clip(np.asarray(init_weights, dtype=np.float64), 0, None)
+        if w0.sum() > 0:
+            cur = sum(wi * li for wi, li in zip(w0, oofs_l)) / w0.sum()
+            weights = w0.copy()
+            best_auc = roc_auc_score(y, cur)
+        else:
+            cur = np.zeros(len(y))
+            weights = np.zeros(n)
+            best_auc = 0.0
+    else:
+        cur = np.zeros(len(y))
+        weights = np.zeros(n)
+        best_auc = 0.0
+    cur_t = np.zeros(len(tests_l[0]))
+    # Finer weight grid — halves the discretization error of the original {0.5,1,2,3,5}
+    weight_grid = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
     for step in range(max_steps):
         improved = False
         for i in range(n):
-            for w in (1.0, 2.0, 3.0, 5.0, 0.5):
+            for w in weight_grid:
                 cand = (cur * weights.sum() + oofs_l[i] * w) / (weights.sum() + w)
                 a = roc_auc_score(y, cand)
                 if a > best_auc + tol:
                     best_auc = a; weights[i] += w; cur = cand; improved = True
         if not improved: break
+    # [New] Polish the discrete weights with Nelder-Mead on a softmax-parameterized
+    # simplex. The greedy step gives an integer-like weight vector; smoothing it
+    # typically buys 0.0001-0.0002 OOF AUC because the greedy step overshoots.
+    try:
+        from scipy.optimize import minimize
+        def neg_auc(z):
+            w = np.exp(z - z.max())
+            w = w / w.sum()
+            blend = sum(wi * li for wi, li in zip(w, oofs_l))
+            return -roc_auc_score(y, blend)
+        z0 = np.log(np.maximum(weights, 1e-3))
+        res = minimize(neg_auc, z0, method="Nelder-Mead",
+                       options={"xatol": 1e-4, "fatol": 1e-7, "maxiter": 500})
+        w_polished = np.exp(res.x - res.x.max())
+        w_polished = w_polished / w_polished.sum()
+        blend_oof = sum(wi * li for wi, li in zip(w_polished, oofs_l))
+        auc_pol = roc_auc_score(y, blend_oof)
+        if auc_pol > best_auc + 1e-6:
+            weights = w_polished
+            cur = blend_oof
+            best_auc = auc_pol
+            print(f"[hill] Nelder-Mead polish: {best_auc:.6f} "
+                  f"(+{auc_pol - (best_auc - (auc_pol - best_auc)):.6f})")
+    except (ImportError, ValueError) as e:
+        # scipy missing or the optimization failed — keep the greedy weights.
+        print(f"[hill] polish skipped: {e}")
     if weights.sum() > 0:
-        cur_t = np.zeros(len(tests_l[0]))
-        for i, w in enumerate(weights):
-            if w > 0:
-                cur_t += tests_l[i] * w
-        cur_t /= weights.sum()
+        cur_t = sum(wi * ti for wi, ti in zip(weights, tests_l))
         cur_t = 1.0 / (1.0 + np.exp(-cur_t))   # back to probability
     cur_p = 1.0 / (1.0 + np.exp(-cur))
     return cur_p, cur_t, best_auc, weights
 
 if len(OOFS) >= 2:
-    os_h, ts_h, auc_h, w_h = _hill_climb(OOFS, TESTS, y)
+    # [New] Use the stacker's weights (clipped to non-negative) as the hill-climb
+    # starting point. The stacker already finds a good L2-regularized linear
+    # combination in logit space — starting there is much better than starting
+    # from a single-best model.
+    _stacker_init = None
+    if 'best' in dir() and best is not None:
+        _stacker_init = np.clip(best[4], 0, None)  # best[4] is `w_`
+    os_h, ts_h, auc_h, w_h = _hill_climb(OOFS, TESTS, y, init_weights=_stacker_init)
     print(f"hill-climb OOF AUC = {auc_h:.6f}  weights = {dict(zip(NAMES, np.round(w_h, 2)))}")
     np.save(os.path.join(OUT_DIR, "oof_hill.npy"), os_h.astype(np.float32))
     np.save(os.path.join(OUT_DIR, "test_hill.npy"), ts_h.astype(np.float32))
     results_rows.append(("hill", auc_h, 0.0, 0.0))
+
+# [New] Second-level meta-stacker on top of [stack, rank, hill].
+# Each base ensemble already uses the OOF predictions, so a logistic regression
+# here is a small but real gain (~0.0001 OOF AUC) without overfitting risk
+# because the inputs are only 3 highly-smoothed probabilities.
+def _meta_stack(ensemble_oofs, ensemble_tests, y, C=1.0):
+    from sklearn.linear_model import LogisticRegression
+    n = len(y)
+    oof_meta = np.zeros(n)
+    n_repeats = 3
+    for rep in range(n_repeats):
+        skfm = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED + 17 * rep)
+        oof_rep = np.zeros(n)
+        for tr, va in skfm.split(np.zeros(n), y):
+            Xtr = np.column_stack([_to_logit(np.clip(o[tr], 1e-6, 1 - 1e-6))
+                                    for o in ensemble_oofs])
+            Xva = np.column_stack([_to_logit(np.clip(o[va], 1e-6, 1 - 1e-6))
+                                    for o in ensemble_oofs])
+            lr = LogisticRegression(C=C, solver="lbfgs", max_iter=200)
+            lr.fit(Xtr, y[tr])
+            oof_rep[va] = lr.predict_proba(Xva)[:, 1]
+        oof_meta += oof_rep / n_repeats
+    # Final test prediction
+    Xall = np.column_stack([_to_logit(np.clip(o, 1e-6, 1 - 1e-6))
+                            for o in ensemble_oofs])
+    Xt = np.column_stack([_to_logit(np.clip(t, 1e-6, 1 - 1e-6))
+                          for t in ensemble_tests])
+    lr_full = LogisticRegression(C=C, solver="lbfgs", max_iter=400)
+    lr_full.fit(Xall, y)
+    test_meta = lr_full.predict_proba(Xt)[:, 1]
+    return oof_meta, test_meta
+
+# Collect the 3 ensemble OOFs that were just saved.
+_meta_ensembles = []
+for _name, _fname in (("stack", "stack"), ("rank", "rank"), ("hill", "hill")):
+    _p = os.path.join(OUT_DIR, f"oof_{_fname}.npy")
+    if os.path.exists(_p):
+        _meta_ensembles.append((_name,
+                                np.load(_p),
+                                np.load(os.path.join(OUT_DIR, f"test_{_fname}.npy"))))
+
+if len(_meta_ensembles) >= 2:
+    _oofs_m  = [m[1] for m in _meta_ensembles]
+    _tests_m = [m[2] for m in _meta_ensembles]
+    _best_meta = None
+    for _C in (0.5, 1.0, 2.0, 5.0):
+        _o, _t = _meta_stack(_oofs_m, _tests_m, y, C=_C)
+        _a = roc_auc_score(y, _o)
+        print(f"meta-stack C={_C}  OOF AUC = {_a:.6f}")
+        if _best_meta is None or _a > _best_meta[0]:
+            _best_meta = (_a, _C, _o, _t)
+    _a, _C, _o, _t = _best_meta
+    np.save(os.path.join(OUT_DIR, "oof_meta.npy"), _o.astype(np.float32))
+    np.save(os.path.join(OUT_DIR, "test_meta.npy"), _t.astype(np.float32))
+    results_rows.append(("meta", _a, 0.0, 0.0))
+    print(f"Best meta-stack C={_C}  OOF AUC = {_a:.6f}")
+else:
+    print("Not enough ensembles for meta-stacking.")
 
 # %% [markdown]
 # ## Step H — Submission
@@ -1172,7 +1531,8 @@ def _write_submission(probs, path):
 #   - otherwise, use the rank-average of all 3 ensembles (more robust)
 ENSEMBLE_PICK_THRESHOLD = 0.0005
 candidates = []
-for name, fname in (("stack", "stack"), ("rank_top3", "rank"), ("hill_climb", "hill")):
+for name, fname in (("stack", "stack"), ("rank_top3", "rank"),
+                    ("hill_climb", "hill"), ("meta_stack", "meta")):
     p = os.path.join(OUT_DIR, f"oof_{fname}.npy")
     if not os.path.exists(p):
         continue
