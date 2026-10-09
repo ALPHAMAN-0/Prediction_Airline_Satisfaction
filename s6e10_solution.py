@@ -21,7 +21,7 @@
 # ## CONFIG
 
 # %%
-import os, sys, time, gc, json, math, glob, warnings, random
+import os, time, gc, glob, warnings, random
 import numpy as np
 import pandas as pd
 
@@ -40,8 +40,12 @@ RUN_RMLP     = bool(int(os.environ.get("RUN_RMLP",     "1")))  # RealMLP via pyt
 RUN_ORIG     = bool(int(os.environ.get("RUN_ORIG",     "1")))  # train on original data
 TUNE_LGBM    = bool(int(os.environ.get("TUNE_LGBM",    "1")))
 
-OUT_DIR      = os.environ.get("OUT_DIR", "/kaggle/working" if os.path.isdir("/kaggle") else "./output")
-DATA_DIR     = os.environ.get("DATA_DIR", "/kaggle/input" if os.path.isdir("/kaggle/input") else "./data")
+OUT_DIR      = os.environ.get(
+    "OUT_DIR", "/kaggle/working" if os.path.isdir("/kaggle") else "./output"
+)
+DATA_DIR     = os.environ.get(
+    "DATA_DIR", "/kaggle/input" if os.path.isdir("/kaggle/input") else "./data"
+)
 
 os.makedirs(OUT_DIR, exist_ok=True)
 print("CONFIG:", dict(SMOKE=SMOKE, N_FOLDS=N_FOLDS, SEED=SEED,
@@ -57,20 +61,21 @@ print("CONFIG:", dict(SMOKE=SMOKE, N_FOLDS=N_FOLDS, SEED=SEED,
 try:
     import psutil
     print(f"CPU count: {psutil.cpu_count()}, RAM: {psutil.virtual_memory().total/1e9:.1f} GB")
-except Exception:
+except ImportError:
     import os as _os
     print(f"CPU count: {_os.cpu_count()}")
 try:
     import torch
     print("torch:", torch.__version__, "cuda:", torch.cuda.is_available(),
           torch.cuda.device_count() if torch.cuda.is_available() else 0)
-except Exception as e:
+except (ImportError, RuntimeError) as e:
     print("no torch:", e)
 try:
     import subprocess as sp
     print(sp.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"],
                  capture_output=True, text=True, timeout=10).stdout)
-except Exception:
+except (ImportError, FileNotFoundError, OSError):
+    # nvidia-smi missing or not on PATH -> just skip the GPU-name banner.
     pass
 
 # %% [markdown]
@@ -103,14 +108,14 @@ def _find_csvs():
         for p in glob.glob(os.path.join(root, "**", "*.csv"), recursive=True):
             try:
                 hdr = pd.read_csv(p, nrows=2)
-            except Exception:
+            except (pd.errors.ParserError, OSError, UnicodeDecodeError):
                 continue
             if "satisfaction" not in hdr.columns:
                 continue
             # look at first non-header value of satisfaction
             try:
                 v = pd.read_csv(p, usecols=["satisfaction"], nrows=5)["satisfaction"].iloc[0]
-            except Exception:
+            except (pd.errors.ParserError, OSError, UnicodeDecodeError, KeyError, ValueError):
                 continue
             if isinstance(v, str):
                 candidates.append(("orig", p))
@@ -175,7 +180,10 @@ CAT_COLS = ["Gender", "Customer Type", "Type of Travel", "Class"]
 NUM_COLS = ["Age", "Flight Distance", "Departure Delay in Minutes", "Arrival Delay in Minutes"]
 RATING_COLS = [c for c in train_raw.columns
                if c not in (["id", "satisfaction", "__y__"] + CAT_COLS + NUM_COLS)]
-print(f"train={train_raw.shape}  test={test_raw.shape}  orig={None if orig_raw is None else orig_raw.shape}")
+print(
+    f"train={train_raw.shape}  test={test_raw.shape}  "
+    f"orig={None if orig_raw is None else orig_raw.shape}"
+)
 print(f"CAT_COLS={CAT_COLS}\nNUM_COLS={NUM_COLS}\nRATING_COLS={RATING_COLS}")
 print(f"positive rate train = {train_raw['__y__'].mean():.4f}")
 
@@ -262,8 +270,10 @@ def run_lgbm(name, params, n_estimators=4000, early_stopping=200, use_extra_feat
     oof = np.zeros(len(train_raw), dtype=np.float64)
     test_pred = np.zeros(len(test_raw),  dtype=np.float64)
     n_used = 0
-    cat_features = [c for c in CAT_COLS if c in RAW_FEATS] + \
-                   ([c for c in RAW_FEATS if c not in CAT_COLS and str(train_raw[c].dtype) == "category"])
+    cat_features = [c for c in CAT_COLS if c in RAW_FEATS] + [
+        c for c in RAW_FEATS
+        if c not in CAT_COLS and str(train_raw[c].dtype) == "category"
+    ]
     for k in range(N_FOLDS):
         tr = FOLDS != k; va = FOLDS == k
         Xtr = train_raw.loc[tr, RAW_FEATS] if use_extra_features is None else pd.concat(
@@ -281,8 +291,14 @@ def run_lgbm(name, params, n_estimators=4000, early_stopping=200, use_extra_feat
                 Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
                 Xte[c] = Xte[c].astype(pd.CategoricalDtype(categories=cats))
         cat_cols = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
-        dtr = lgb.Dataset(Xtr, train_raw.loc[tr, "__y__"], categorical_feature=cat_cols, free_raw_data=False)
-        dva = lgb.Dataset(Xva, train_raw.loc[va, "__y__"], categorical_feature=cat_cols, reference=dtr, free_raw_data=False)
+        dtr = lgb.Dataset(
+            Xtr, train_raw.loc[tr, "__y__"],
+            categorical_feature=cat_cols, free_raw_data=False,
+        )
+        dva = lgb.Dataset(
+            Xva, train_raw.loc[va, "__y__"],
+            categorical_feature=cat_cols, reference=dtr, free_raw_data=False,
+        )
         model = lgb.train(params, dtr, num_boost_round=n_estimators,
                           valid_sets=[dva], valid_names=["val"],
                           callbacks=[lgb.early_stopping(early_stopping, verbose=False),
@@ -424,7 +440,13 @@ def _attach_label_safe(df):
 # %%
 ORIG_OOF_NAME = "orig_xgb"
 ORIG_TEST_NAME = "orig_xgb"
-if RUN_ORIG and orig_raw is not None and not _have("orig_proba") and not _have("orig_xgb"):
+# Resume-safety: skip if we already have the feature file in either the new
+# (feat_orig_proba_*.npy) or legacy (oof_orig_proba.npy) naming.
+_orig_proba_present = (
+    os.path.exists(os.path.join(OUT_DIR, "feat_orig_proba_train.npy"))
+    or os.path.exists(os.path.join(OUT_DIR, "oof_orig_proba.npy"))
+)
+if RUN_ORIG and orig_raw is not None and not _orig_proba_present and not _have("orig_xgb"):
     try:
         import xgboost as xgb
         X = _cast_cats(orig_raw[RAW_FEATS])
@@ -453,16 +475,21 @@ if RUN_ORIG and orig_raw is not None and not _have("orig_proba") and not _have("
         dtest_test  = xgb.DMatrix(_cast_cats(test_raw[RAW_FEATS]),  enable_categorical=True)
         orig_proba_train = bst.predict(dtest_train)
         orig_proba_test  = bst.predict(dtest_test)
-        # Save as test/train "OOF" so we can merge later
-        np.save(os.path.join(OUT_DIR, "oof_orig_proba.npy"), orig_proba_train.astype(np.float32))
-        np.save(os.path.join(OUT_DIR, "test_orig_proba.npy"), orig_proba_test.astype(np.float32))
+        # Save as features so we can merge later. NOTE: these are NOT OOF predictions;
+        # the model that produced them was trained on the original (label-safe) dataset
+        # and the prediction was made on the full competition train+test. The filename
+        # prefix `feat_` makes that explicit so no one tries to compute an OOF AUC on it.
+        np.save(os.path.join(OUT_DIR, "feat_orig_proba_train.npy"),
+                orig_proba_train.astype(np.float32))
+        np.save(os.path.join(OUT_DIR, "feat_orig_proba_test.npy"),
+                orig_proba_test.astype(np.float32))
         # Log
         # NOTE: this prediction was made with a model that SAW the labels used here.
         # It's a feature, not an OOF. We still want it in results.csv for visibility.
         # We do not compute a real OOF AUC for this one.
         results_rows.append(("orig_proba", float("nan"), float("nan"), 0.5))
         print("[orig_proba] saved train/test predictions (feature, no OOF).")
-    except Exception as e:
+    except (ImportError, ValueError, RuntimeError) as e:
         print("orig_proba step failed:", e)
         RUN_ORIG = False
 
@@ -528,7 +555,9 @@ def _route_x_segment_kfold(segs=("Class", "Type of Travel", "Customer Type"),
         # test = full rate per key
         keys_te = (test_raw["Flight Distance"].astype(str).values + "|"
                    + test_raw[seg].astype(str).values)
-        feats_te[f"route_x_{seg}_y"] = pd.Series(keys_te).map(rate_full_dict).fillna(PRIOR).astype("float32")
+        feats_te[f"route_x_{seg}_y"] = (
+            pd.Series(keys_te).map(rate_full_dict).fillna(PRIOR).astype("float32")
+        )
     return feats_tr, feats_te
 
 ROUTE_X_SEG_TR, ROUTE_X_SEG_TE = _route_x_segment_kfold()
@@ -599,9 +628,13 @@ def build_full():
     base_tr = _attach_label_safe(base_tr)
     base_te = _attach_label_safe(base_te)
     # orig_proba (if available)
-    if os.path.exists(os.path.join(OUT_DIR, "oof_orig_proba.npy")):
-        base_tr["orig_proba"] = np.load(os.path.join(OUT_DIR, "oof_orig_proba.npy")).astype("float32")
-        base_te["orig_proba"] = np.load(os.path.join(OUT_DIR, "test_orig_proba.npy")).astype("float32")
+    if os.path.exists(os.path.join(OUT_DIR, "feat_orig_proba_train.npy")):
+        base_tr["orig_proba"] = np.load(
+            os.path.join(OUT_DIR, "feat_orig_proba_train.npy")
+        ).astype("float32")
+        base_te["orig_proba"] = np.load(
+            os.path.join(OUT_DIR, "feat_orig_proba_test.npy")
+        ).astype("float32")
     # te / cond / freq / route_x_seg
     base_tr = pd.concat([base_tr.reset_index(drop=True),
                          TE_TRAIN.reset_index(drop=True),
@@ -652,7 +685,11 @@ def lgb_oof(params, n_estimators=4000, early_stopping=200):
                 Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
         cat_cols = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
         dtr = lgb.Dataset(Xtr, ytr, categorical_feature=cat_cols, free_raw_data=False)
-        dva = lgb.Dataset(Xva, yva, categorical_feature=cat_cols, reference=dtr, free_raw_data=False)
+        dva = lgb.Dataset(
+            Xva, yva,
+            categorical_feature=cat_cols,
+            reference=dtr, free_raw_data=False,
+        )
         m = lgb.train(params, dtr, num_boost_round=n_estimators, valid_sets=[dva],
                       callbacks=[lgb.early_stopping(early_stopping, verbose=False),
                                  lgb.log_evaluation(0)])
@@ -694,7 +731,11 @@ if TUNE_LGBM:
                     Xva[c] = Xva[c].astype(pd.CategoricalDtype(categories=cats))
             cat_cols = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
             dtr = lgb.Dataset(Xtr, yt[tr], categorical_feature=cat_cols, free_raw_data=False)
-            dva = lgb.Dataset(Xva, yt[va], categorical_feature=cat_cols, reference=dtr, free_raw_data=False)
+            dva = lgb.Dataset(
+                Xva, yt[va],
+                categorical_feature=cat_cols,
+                reference=dtr, free_raw_data=False,
+            )
             m = lgb.train(p, dtr, num_boost_round=2000, valid_sets=[dva],
                           callbacks=[lgb.early_stopping(100, verbose=False),
                                      lgb.log_evaluation(0)])
@@ -723,7 +764,9 @@ if TUNE_LGBM:
                                   min_data_in_leaf=bp["min_data"], feature_fraction=bp["ff"],
                                   bagging_fraction=bp["bf"], lambda_l1=bp["l1"],
                                   lambda_l2=bp["l2"], max_bin=bp["max_bin"]))
-    except Exception as e:
+    except (AttributeError, KeyError, TypeError) as e:
+        # optuna study may not exist (TUNE_LGBM was off) or bp may be missing keys.
+        # Either way, just keep the default LGBM_BEST.
         print("optuna overwrite skipped:", e)
 
 # Use a helper that reuses FULL_TR/TE
@@ -752,7 +795,11 @@ def run_lgbm_full(name, params, n_estimators=4000, early_stopping=200):
                 Xte[c] = Xte[c].astype(pd.CategoricalDtype(categories=cats))
         cat_cols = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
         dtr = lgb.Dataset(Xtr, ytr, categorical_feature=cat_cols, free_raw_data=False)
-        dva = lgb.Dataset(Xva, yva, categorical_feature=cat_cols, reference=dtr, free_raw_data=False)
+        dva = lgb.Dataset(
+            Xva, yva,
+            categorical_feature=cat_cols,
+            reference=dtr, free_raw_data=False,
+        )
         m = lgb.train(params, dtr, num_boost_round=n_estimators,
                       valid_sets=[dva], valid_names=["val"],
                       callbacks=[lgb.early_stopping(early_stopping, verbose=False),
@@ -773,20 +820,29 @@ if RUN_LGBM_ET:
 
 # [Change 3] 3-seed bag of lgbm_full_et (extra_trees), averaged in logit space.
 # This adds 2 more diverse members to the ensemble without doubling the model
-# cost. Each member is a separate OOF/test pair.
+# cost. Each member is a separate OOF/test pair. Logit-space averaging is
+# typically +0.0001-0.0003 AUC over probability-space averaging.
+def _logit(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+def _sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
 if RUN_LGBM_ET and os.environ.get("RUN_LGBM_BAG", "1") == "1":
     p_et_bag = dict(LGBM_BEST); p_et_bag.update(extra_trees=True)
-    oof_acc = None; test_acc = None
+    oof_logit_acc = None; test_logit_acc = None
     for s in (SEED + 101, SEED + 202, SEED + 303):
         p = dict(p_et_bag); p["seed"] = s
         p["feature_fraction_seed"] = s
         p["bagging_seed"] = s
         name = f"lgbm_full_et_s{s % 1000}"
         o, t = run_lgbm_full(name, p)
-        oof_acc  = o  if oof_acc  is None else oof_acc  + o
-        test_acc = t  if test_acc is None else test_acc + t
-    oof_acc /= 3.0; test_acc /= 3.0
-    log_result("lgbm_full_et_bag", oof_acc, test_acc, 0.0, N_FOLDS)
+        oof_logit_acc  = _logit(o) if oof_logit_acc  is None else oof_logit_acc  + _logit(o)
+        test_logit_acc = _logit(t) if test_logit_acc is None else test_logit_acc + _logit(t)
+    oof_bag  = _sigmoid(oof_logit_acc  / 3.0)
+    test_bag = _sigmoid(test_logit_acc / 3.0)
+    log_result("lgbm_full_et_bag", oof_bag, test_bag, 0.0, N_FOLDS)
 
 # %% [markdown]
 # ## Step F.1 — XGBoost (GPU)
@@ -806,7 +862,8 @@ if RUN_XGB:
         try:
             # quick GPU availability check
             xgb.DMatrix(np.zeros((2, 2))).slice([0, 1])
-        except Exception:
+        except (xgb.core.XGBoostError, RuntimeError):
+            # No CUDA-capable XGBoost build available -> fall back to CPU.
             device = "cpu"
         params = dict(objective="binary:logistic", eval_metric="auc",
                       tree_method="hist", device=device,
@@ -841,8 +898,9 @@ if RUN_XGB:
         log_result("xgb_full", oof, tp, minutes, N_FOLDS)
         del booster; gc.collect()
         try:
-            import torch; torch.cuda.empty_cache()
-        except Exception:
+            import torch
+            torch.cuda.empty_cache()
+        except (ImportError, RuntimeError):
             pass
 
 # %% [markdown]
@@ -869,7 +927,8 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
             import torch
             if not torch.cuda.is_available():
                 task_type = "CPU"
-        except Exception:
+        except (ImportError, RuntimeError):
+            # torch not installed, or CUDA driver missing -> fall back to CPU.
             task_type = "CPU"
     for k in range(N_FOLDS):
         tr = FOLDS != k; va = FOLDS == k
@@ -878,7 +937,9 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
         yva = train_raw.loc[va, "__y__"].values
         for c in cat_features:
             if c in Xtr.columns:
-                Xtr[c] = Xtr[c].astype(str); Xva[c] = Xva[c].astype(str); Xte[c] = Xte[c].astype(str)
+                Xtr[c] = Xtr[c].astype(str)
+                Xva[c] = Xva[c].astype(str)
+                Xte[c] = Xte[c].astype(str)
         kw = dict(iterations=iters, learning_rate=lr, depth=depth,
                   grow_policy=grow, loss_function=loss, eval_metric=loss,
                   od_type=od_type, od_wait=od_wait,
@@ -896,8 +957,9 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
     log_result(name, oof, tp, minutes, N_FOLDS)
     del model; gc.collect()
     try:
-        import torch; torch.cuda.empty_cache()
-    except Exception:
+        import torch
+        torch.cuda.empty_cache()
+    except (ImportError, RuntimeError):
         pass
     return oof, tp
 
@@ -942,11 +1004,16 @@ if RUN_RMLP:
                 oof[va] = clf.predict_proba(Xva)[:, 1]
                 tp += clf.predict_proba(Xte)[:, 1] / N_FOLDS
                 del clf; gc.collect()
-                try: import torch; torch.cuda.empty_cache()
-                except Exception: pass
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except (ImportError, RuntimeError):
+                    pass
             minutes = (time.time() - t0) / 60.0
             log_result("realmlp_full", oof, tp, minutes, N_FOLDS)
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError) as e:
+        # RealMLP is optional. Failures here (e.g. pytabkit missing, CUDA OOM)
+        # should disable the rest of the RealMLP block, not crash the pipeline.
         print("RealMLP step failed:", e)
         RUN_RMLP = False
 
@@ -1030,8 +1097,14 @@ if len(OOFS) >= 3:
     aucs = [roc_auc_score(y, o) for o in OOFS]
     order = np.argsort(aucs)[::-1]
     top3 = order[:3]
-    os_rank = np.mean([np.argsort(np.argsort(OOFS[i])) / (len(OOFS[i]) - 1) for i in top3], axis=0)
-    ts_rank = np.mean([np.argsort(np.argsort(TESTS[i])) / (len(TESTS[i]) - 1) for i in top3], axis=0)
+    os_rank = np.mean(
+        [np.argsort(np.argsort(OOFS[i])) / (len(OOFS[i]) - 1) for i in top3],
+        axis=0,
+    )
+    ts_rank = np.mean(
+        [np.argsort(np.argsort(TESTS[i])) / (len(TESTS[i]) - 1) for i in top3],
+        axis=0,
+    )
     a_rank = roc_auc_score(y, os_rank)
     print(f"rank-avg top-3 OOF AUC = {a_rank:.6f}")
     np.save(os.path.join(OUT_DIR, "oof_rank.npy"), os_rank.astype(np.float32))
@@ -1085,7 +1158,10 @@ def _write_submission(probs, path):
     assert sub["satisfaction"].notna().all(), "NaN in submission"
     assert sub["satisfaction"].between(0, 1).all(), "values outside [0,1]"
     sub.to_csv(path, index=False)
-    print(f"wrote {path}: {sub.shape}  (min={sub['satisfaction'].min():.4f}, max={sub['satisfaction'].max():.4f})")
+    print(
+        f"wrote {path}: {sub.shape}  "
+        f"(min={sub['satisfaction'].min():.4f}, max={sub['satisfaction'].max():.4f})"
+    )
 
 # Pick best by OOF AUC among stack / rank / hill
 candidates = []
@@ -1103,7 +1179,10 @@ _write_submission(best_test, os.path.join(OUT_DIR, "submission.csv"))
 if len(OOFS) >= 3:
     aucs = [roc_auc_score(y, o) for o in OOFS]
     order = np.argsort(aucs)[::-1][:3]
-    ts_rank_safe = np.mean([np.argsort(np.argsort(TESTS[i])) / (len(TESTS[i]) - 1) for i in order], axis=0)
+    ts_rank_safe = np.mean(
+        [np.argsort(np.argsort(TESTS[i])) / (len(TESTS[i]) - 1) for i in order],
+        axis=0,
+    )
     _write_submission(ts_rank_safe, os.path.join(OUT_DIR, "submission_safe.csv"))
 
 # %% [markdown]
