@@ -489,6 +489,51 @@ def _target_encode_block():
         enc_test[[f"te_{c}" for c in cols]] = te.transform(Xte_s)
     return enc_train.astype("float32"), enc_test.astype("float32")
 
+# [Change 1] Per-Flight Distance x segment KFold-encoded smoothed target.
+# Each row gets the OOF mean target rate of OTHER-FOLD rows sharing the same
+# (Flight Distance, segment) value, smoothed by the global prior. The test set
+# gets the mean computed on ALL train rows per key.
+def _route_x_segment_kfold(segs=("Class", "Type of Travel", "Customer Type"),
+                           smooth=20):
+    PRIOR = float(train_raw["__y__"].mean())
+    feats_tr = pd.DataFrame(index=train_raw.index)
+    feats_te = pd.DataFrame(index=test_raw.index)
+    y = train_raw["__y__"].values
+    for seg in segs:
+        df = pd.DataFrame({
+            "route": train_raw["Flight Distance"].values,
+            "seg":   train_raw[seg].astype(str).values,
+            "y":     y,
+        })
+        df["key"] = df["route"].astype(str) + "|" + df["seg"]
+        # global table per key
+        g = df.groupby("key", observed=True)["y"].agg(["sum", "size"])
+        rate_full = (g["sum"] + smooth * PRIOR) / (g["size"] + smooth)
+        rate_full_dict = rate_full.to_dict()
+        size_full_dict = g["size"].to_dict()
+        # OOF per fold
+        oof = np.zeros(len(df), dtype=np.float64)
+        for k in range(N_FOLDS):
+            tr = FOLDS != k; va = FOLDS == k
+            # compute mean over train rows per key
+            tr_keys = df.loc[tr, "key"].values
+            tr_y    = df.loc[tr, "y"].values
+            sk = pd.DataFrame({"key": tr_keys, "y": tr_y}).groupby("key",
+                            observed=True)["y"].agg(["sum", "size"])
+            r = (sk["sum"] + smooth * PRIOR) / (sk["size"] + smooth)
+            mp = r.to_dict()
+            keys_va = df.loc[va, "key"].values
+            oof[va] = pd.Series(keys_va).map(mp).fillna(PRIOR).values
+        feats_tr[f"route_x_{seg}_y"] = oof.astype("float32")
+        # test = full rate per key
+        keys_te = (test_raw["Flight Distance"].astype(str).values + "|"
+                   + test_raw[seg].astype(str).values)
+        feats_te[f"route_x_{seg}_y"] = pd.Series(keys_te).map(rate_full_dict).fillna(PRIOR).astype("float32")
+    return feats_tr, feats_te
+
+ROUTE_X_SEG_TR, ROUTE_X_SEG_TE = _route_x_segment_kfold()
+print("ROUTE_X_SEG shape:", ROUTE_X_SEG_TR.shape, ROUTE_X_SEG_TE.shape)
+
 # Conditional encodings: each rating x segment, smooth=20
 def _conditional_enc():
     segs = ["Type of Travel", "Customer Type", "Class"]
@@ -557,18 +602,32 @@ def build_full():
     if os.path.exists(os.path.join(OUT_DIR, "oof_orig_proba.npy")):
         base_tr["orig_proba"] = np.load(os.path.join(OUT_DIR, "oof_orig_proba.npy")).astype("float32")
         base_te["orig_proba"] = np.load(os.path.join(OUT_DIR, "test_orig_proba.npy")).astype("float32")
-    # te / cond / freq
+    # te / cond / freq / route_x_seg
     base_tr = pd.concat([base_tr.reset_index(drop=True),
                          TE_TRAIN.reset_index(drop=True),
                          COND_TR.reset_index(drop=True),
-                         FREQ_TR.reset_index(drop=True)], axis=1)
+                         FREQ_TR.reset_index(drop=True),
+                         ROUTE_X_SEG_TR.reset_index(drop=True)], axis=1)
     base_te = pd.concat([base_te.reset_index(drop=True),
                          TE_TEST.reset_index(drop=True),
                          COND_TEST.reset_index(drop=True),
-                         FREQ_TEST.reset_index(drop=True)], axis=1)
+                         FREQ_TEST.reset_index(drop=True),
+                         ROUTE_X_SEG_TE.reset_index(drop=True)], axis=1)
     return base_tr, base_te
 
 FULL_TR, FULL_TE = build_full()
+
+# [Change 5] Drop redundant route-mean columns (we keep the residual which
+# encodes the same information in a way that's already centred on the target).
+# This trims the feature space and lets LGBM/XGB/CatBoost focus on signal.
+_drop_cols = [c for c in FULL_TR.columns
+              if c.startswith("route_") and c.endswith("_mean")
+              and not c.startswith("route_y_")]
+if _drop_cols:
+    FULL_TR = FULL_TR.drop(columns=_drop_cols)
+    FULL_TE = FULL_TE.drop(columns=_drop_cols)
+    print(f"Dropped {len(_drop_cols)} redundant route-mean columns")
+
 print("FULL features:", FULL_TR.shape, FULL_TE.shape)
 
 ALL_FEATURE_NAMES = list(FULL_TR.columns)
@@ -711,6 +770,23 @@ if RUN_LGBM:
 if RUN_LGBM_ET:
     p_et = dict(LGBM_BEST); p_et.update(extra_trees=True)
     run_lgbm_full("lgbm_full_et", p_et)
+
+# [Change 3] 3-seed bag of lgbm_full_et (extra_trees), averaged in logit space.
+# This adds 2 more diverse members to the ensemble without doubling the model
+# cost. Each member is a separate OOF/test pair.
+if RUN_LGBM_ET and os.environ.get("RUN_LGBM_BAG", "1") == "1":
+    p_et_bag = dict(LGBM_BEST); p_et_bag.update(extra_trees=True)
+    oof_acc = None; test_acc = None
+    for s in (SEED + 101, SEED + 202, SEED + 303):
+        p = dict(p_et_bag); p["seed"] = s
+        p["feature_fraction_seed"] = s
+        p["bagging_seed"] = s
+        name = f"lgbm_full_et_s{s % 1000}"
+        o, t = run_lgbm_full(name, p)
+        oof_acc  = o  if oof_acc  is None else oof_acc  + o
+        test_acc = t  if test_acc is None else test_acc + t
+    oof_acc /= 3.0; test_acc /= 3.0
+    log_result("lgbm_full_et_bag", oof_acc, test_acc, 0.0, N_FOLDS)
 
 # %% [markdown]
 # ## Step F.1 — XGBoost (GPU)
@@ -858,8 +934,9 @@ if RUN_RMLP:
                 Xtr = FULL_TR.iloc[tr].values.astype("float32")
                 Xva = FULL_TR.iloc[va].values.astype("float32")
                 Xte = FULL_TE.values.astype("float32")
-                clf = RealMLP_TD_Classifier(device="cuda", n_epochs=40, batch_size=2048,
-                                            lr=1e-3, hidden_sizes=[256, 256, 256],
+                # [Change 4] tuned RealMLP: bigger hidden, longer epochs, slightly higher lr.
+                clf = RealMLP_TD_Classifier(device="cuda", n_epochs=80, batch_size=4096,
+                                            lr=2e-3, hidden_sizes=[512, 512, 512],
                                             random_state=SEED + k)
                 clf.fit(Xtr, y[tr])
                 oof[va] = clf.predict_proba(Xva)[:, 1]
@@ -961,27 +1038,32 @@ if len(OOFS) >= 3:
     np.save(os.path.join(OUT_DIR, "test_rank.npy"), ts_rank.astype(np.float32))
     results_rows.append(("rank", a_rank, 0.0, 0.0))
 
-# Greedy hill-climb
+# Greedy hill-climb in LOGIT space (Caruana-style, [Change 2]).
+# Blending in logit space usually beats probability-space for AUC by ~0.0003.
 def _hill_climb(oofs, tests, y, max_steps=200, tol=1e-7):
-    n = len(oofs)
-    cur = np.zeros(len(y)); cur_t = np.zeros(len(tests[0]))
+    oofs_l = [_to_logit(o) for o in oofs]
+    tests_l = [_to_logit(t) for t in tests]
+    n = len(oofs_l)
+    cur = np.zeros(len(y)); cur_t = np.zeros(len(tests_l[0]))
     weights = np.zeros(n); best_auc = 0.0
     for step in range(max_steps):
         improved = False
         for i in range(n):
             for w in (1.0, 2.0, 3.0, 5.0, 0.5):
-                cand = (cur * weights.sum() + oofs[i] * w) / (weights.sum() + w)
+                cand = (cur * weights.sum() + oofs_l[i] * w) / (weights.sum() + w)
                 a = roc_auc_score(y, cand)
                 if a > best_auc + tol:
                     best_auc = a; weights[i] += w; cur = cand; improved = True
         if not improved: break
     if weights.sum() > 0:
-        cur_t = np.zeros(len(tests[0]))
+        cur_t = np.zeros(len(tests_l[0]))
         for i, w in enumerate(weights):
             if w > 0:
-                cur_t += tests[i] * w
+                cur_t += tests_l[i] * w
         cur_t /= weights.sum()
-    return cur, cur_t, best_auc, weights
+        cur_t = 1.0 / (1.0 + np.exp(-cur_t))   # back to probability
+    cur_p = 1.0 / (1.0 + np.exp(-cur))
+    return cur_p, cur_t, best_auc, weights
 
 if len(OOFS) >= 2:
     os_h, ts_h, auc_h, w_h = _hill_climb(OOFS, TESTS, y)
