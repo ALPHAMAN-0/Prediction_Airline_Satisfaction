@@ -236,3 +236,57 @@ def make_aligned_categoricals(*dfs: pd.DataFrame) -> list[pd.DataFrame]:
             if c in d.columns:
                 d[c] = d[c].astype(pd.CategoricalDtype(categories=cc))
     return out
+
+
+# ----- blend / stack -------------------------------------------------------
+def _stack_lr(oofs: list[np.ndarray], tests: list[np.ndarray], y: np.ndarray,
+              C: float = 0.02, n_repeats: int = 3,
+              seed: int = SEED) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Nested-CV logistic stacker on logits. Returns (oof_stack, test_stack, weights)."""
+    from sklearn.linear_model import LogisticRegression
+    n = len(y)
+    oof_stack = np.zeros(n)
+    for rep in range(n_repeats):
+        skf2 = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed + rep)
+        oof_rep = np.zeros(n)
+        for tr, va in skf2.split(np.zeros(n), y):
+            Xtr = np.column_stack([_to_logit(o[tr]) for o in oofs])
+            Xva = np.column_stack([_to_logit(o[va]) for o in oofs])
+            lr = LogisticRegression(C=C, solver="lbfgs", max_iter=200)
+            lr.fit(Xtr, y[tr])
+            oof_rep[va] = lr.predict_proba(Xva)[:, 1]
+        oof_stack += oof_rep / n_repeats
+    # Final weights
+    Xall = np.column_stack([_to_logit(o) for o in oofs])
+    lr = LogisticRegression(C=C, solver="lbfgs", max_iter=400)
+    lr.fit(Xall, y)
+    weights = lr.coef_[0]
+    Xt = np.column_stack([_to_logit(t) for t in tests])
+    test_stack = lr.predict_proba(Xt)[:, 1]
+    return oof_stack, test_stack, weights
+
+
+def best_blend(min_names: int = 2) -> tuple[str, float, np.ndarray, np.ndarray] | None:
+    """Pick the highest nested-CV stacker AUC across C values; return
+    (best_name, oof_auc, oof_stack, test_stack) or None if not enough
+    OOFs exist."""
+    names = list_oofs()
+    if len(names) < min_names:
+        return None
+    tr = load_train_test()[0]
+    y = tr["__y__"].values
+    oofs = [load_oof(n) for n in names]
+    tests = [load_pred(n) for n in names]
+    best = None
+    for C in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2]:
+        os_, ts_, w_ = _stack_lr(oofs, tests, y, C=C, n_repeats=2)
+        a = float(roc_auc_score(y, os_))
+        if best is None or a > best[1]:
+            best = (f"stack_C={C}", a, os_, ts_)
+    return best
+
+
+def write_blend_outputs(oof_stack: np.ndarray, test_stack: np.ndarray,
+                        name: str = "stack") -> None:
+    np.save(oof_path(name), oof_stack.astype(np.float32))
+    np.save(pred_path(name), test_stack.astype(np.float32))

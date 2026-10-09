@@ -233,3 +233,58 @@ def test_t7_route_aggregates_deterministic_label_free():
     assert counts.loc[100] == 2
     assert counts.loc[200] == 3
     assert counts.loc[300] == 4
+
+
+# ----- T8: target encoding is fold-safe and matches hand-computed values --
+def test_t8_target_encoding_fold_safe_and_values():
+    """Build a 4-way key (cls, type, cust, route) and check the per-key
+    smoothed target encoding is correct, leak-free, and matches a
+    hand-computed value on a 6-row table."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "exp_C_te", os.path.join(ROOT, "exp_C_te.py"))
+    if spec is None or spec.loader is None:
+        pytest.skip("exp_C_te.py not built yet")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except (FileNotFoundError, SyntaxError, ImportError) as e:
+        pytest.skip(f"exp_C_te.py not ready: {e}")
+
+    # 6-row hand-made table
+    df = pd.DataFrame({
+        "cls":   ["A", "A", "A", "B", "B", "B"],
+        "type":  ["t1", "t1", "t2", "t1", "t2", "t2"],
+        "cust":  ["L",  "L",  "D",  "L",  "D",  "D"],
+        "route": [100, 100, 200, 200, 300, 300],
+        "y":     [  1,   0,   1,   1,   0,   1],
+    })
+    df["__y__"] = df["y"]  # the implementation reads "__y__"
+    df = df.rename(columns={"cls": "Class", "type": "Type of Travel",
+                            "cust": "Customer Type", "route": "Flight Distance"})
+    # Build a fold assignment (2 folds)
+    folds = np.array([0, 1, 0, 1, 0, 1])
+    keys = df["Class"].astype(str) + "|" + df["Type of Travel"].astype(str) + "|" + \
+           df["Customer Type"].astype(str) + "|" + df["Flight Distance"].astype(str)
+    PRIOR = float(df["y"].mean())
+    SMOOTH = 1  # so hand-computed is easy
+    oof, full = mod._te_4way_kfold(df, folds, PRIOR=PRIOR, SMOOTH=SMOOTH,
+                                   cols=("Class","Type of Travel","Customer Type","Flight Distance"))
+    # row 0 (fold 0): must use fold-1 only. Fold 1 has key "A|t1|L|100" once
+    # with y=0. So oof[0] = (0 + 1*PRIOR) / (1 + 1) = PRIOR/2
+    expected_0 = (0 + SMOOTH * PRIOR) / (1 + SMOOTH)
+    assert abs(oof[0] - expected_0) < 1e-6, f"row0 {oof[0]} vs {expected_0}"
+    # row 1 (fold 1): must use fold-0 only. Fold 0 has key "A|t1|L|100" once
+    # with y=1. So oof[1] = (1 + PRIOR) / 2
+    expected_1 = (1 + SMOOTH * PRIOR) / (1 + SMOOTH)
+    assert abs(oof[1] - expected_1) < 1e-6, f"row1 {oof[1]} vs {expected_1}"
+    # full is computed on the full table (the eventual test-set encoding)
+    # key "A|t1|L|100" has sum=1, size=2 -> (1 + PRIOR) / (2 + 1)
+    full_a = full.get("A|t1|L|100")
+    if full_a is None:
+        # full may be a dict or a Series indexed by key
+        full_a = full["A|t1|L|100"] if "A|t1|L|100" in full.index else None
+    assert full_a is not None
+    expected_full = (1 + SMOOTH * PRIOR) / (2 + SMOOTH)
+    assert abs(float(full_a) - expected_full) < 1e-6, \
+        f"full {full_a} vs {expected_full}"
