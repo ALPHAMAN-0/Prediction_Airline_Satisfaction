@@ -1,1 +1,2 @@
 exp_id,change,oof_auc,delta,per_fold_aucs,blend_auc,runtime_min,result,notes
+0_sanity,plain LGBM on raw features (sanity check),0.95881,0.0,"0.9589,0.9578,0.9595,0.9588,0.9592",0.0,1.32,CHAMPION,5-fold full data; expected ~0.9588; sets GATE=0.000064

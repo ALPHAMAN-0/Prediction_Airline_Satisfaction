@@ -28,15 +28,32 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 
 | round | champion | OOF AUC | blend AUC | GATE |
 |---|---|---|---|---|
-| 0 | (none yet — first run) | — | — | — |
+| 0 (sanity) | `lgbm_raw` (raw features only) | **0.958810** | — | **0.000064** |
+| 1 (B) | TBD | TBD | TBD | 0.000064 |
+
+## STEP 0 diagnostics
+
+- **Sanity `lgbm_raw`** (full 5-fold): OOF AUC = **0.958810**, runtime
+  1.3 min, per-fold = [0.9589, 0.9578, 0.9595, 0.9588, 0.9592].
+  Matches the user's expected ≈ 0.9588 — harness is correct.
+- **Noise check** (3 seeds, 42 / 53 / 64): OOF AUCs = 0.958810,
+  0.958873, 0.958834. Stdev = 0.000032. **GATE = 0.000064**.
+- **Adversarial validation** AUC = **0.4995** — train and test are
+  indistinguishable, folds are perfectly trustworthy. No correction
+  needed for OOF→public-LB gap beyond the usual 0.0003-0.0006.
 
 ## Best blend
 
-(none yet)
+(none yet — only 1 OOF; nested-CV stacker with 1 OOF is undefined)
 
 ## Last 10 experiments
 
 (see `experiments.csv`)
+
+### Per-segment AUC at sanity baseline
+
+(0.9588 OOF — overall; per-segment analysis deferred until we have a
+non-trivial model)
 
 ## Per-segment AUC (after a NEW CHAMPION)
 
