@@ -288,3 +288,56 @@ def test_t8_target_encoding_fold_safe_and_values():
     expected_full = (1 + SMOOTH * PRIOR) / (2 + SMOOTH)
     assert abs(float(full_a) - expected_full) < 1e-6, \
         f"full {full_a} vs {expected_full}"
+
+
+# ----- T9: small interaction features are correct on a hand-made table ----
+def test_t9_small_interactions_correct():
+    """Build rating aggregates, delay features, missing flag on a
+    hand-made table; compare to hand-computed values."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "exp_D_small", os.path.join(ROOT, "exp_D_small.py"))
+    if spec is None or spec.loader is None:
+        pytest.skip("exp_D_small.py not built yet")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except (FileNotFoundError, SyntaxError, ImportError) as e:
+        pytest.skip(f"exp_D_small.py not ready: {e}")
+
+    df = pd.DataFrame({
+        "Departure Delay in Minutes": [0.0, 10.0, 30.0, 0.0, 5.0],
+        "Arrival Delay in Minutes":   [0.0,  float("nan"), 5.0, 0.0, 0.0],
+        "r1": [1, 2, 3, 4, 5],
+        "r2": [5, 4, 3, 2, 0],
+        "r3": [0, 0, 1, 2, 3],
+    })
+    out = mod._add_small_features(df)
+    # log1p of delays (0 -> 0; 10 -> 2.4; 30 -> 3.4; etc.)
+    np.testing.assert_allclose(out["log_dep_delay"].iloc[0], 0.0)
+    np.testing.assert_allclose(out["log_arr_delay"].iloc[0], 0.0)
+    np.testing.assert_allclose(out["log_dep_delay"].iloc[2], np.log1p(30.0))
+    # delay diff = dep - arr
+    np.testing.assert_allclose(out["delay_diff"].iloc[0], 0.0)
+    np.testing.assert_allclose(out["delay_diff"].iloc[2], 30.0 - 5.0)
+    # has_arr_delay is False for the NaN row (1)
+    assert bool(out["has_arr_delay"].iloc[1]) is False
+    assert bool(out["has_arr_delay"].iloc[2]) is True
+    # arr_delay_missing
+    assert bool(out["arr_delay_missing"].iloc[1]) is True
+    assert bool(out["arr_delay_missing"].iloc[0]) is False
+    # rating aggregates
+    rvals = df[["r1","r2","r3"]]
+    np.testing.assert_allclose(out["rating_mean"].iloc[0], rvals.iloc[0].mean())
+    np.testing.assert_allclose(out["rating_min"].iloc[4], 0.0)
+    np.testing.assert_allclose(out["rating_max"].iloc[4], 5.0)
+    # count of 0 ratings
+    assert int(out["n_zero_ratings"].iloc[0]) == 1  # r3
+    assert int(out["n_zero_ratings"].iloc[4]) == 1  # r2
+    assert int(out["n_zero_ratings"].iloc[2]) == 0  # none
+    # low_rating_frac (<=2): r1=1 and r3=0 are both <=2, so 2/3
+    np.testing.assert_allclose(out["low_rating_frac"].iloc[0], 2/3)
+    # high_rating_frac (>=4): r2=5, so 1/3
+    np.testing.assert_allclose(out["high_rating_frac"].iloc[0], 1/3)
+    # flat_rater
+    assert bool(out["flat_rater"].iloc[3]) is False  # 4,2,2 not flat

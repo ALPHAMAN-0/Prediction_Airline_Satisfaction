@@ -30,9 +30,10 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 |---|---|---|---|---|---|
 | 0 (sanity) | `lgbm_raw` (raw features only) | 0.958810 | — | — | 0.000064 |
 | 1 (B) | `lgbm_full` (route features) | **0.960421** | **+0.001611** | — | 0.000064 |
-| 2 (C) | `lgbm_full` (still champion) | 0.960421 | 0 | **0.960685** (blend) | 0.000064 |
+| 2 (C) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960685 (blend) | 0.000064 |
+| 3 (D) | `lgbm_full` (still champion) | 0.960421 | 0 | **0.960739** (blend) | 0.000064 |
 
-We're at **0.960685** in the blend, which clears the 0.9605 goal. Single
+We're at **0.960739** in the blend, which clears the 0.9605 goal. Single
 model is at 0.960421 (just below 0.9605); the next model-variety round
 (E) should close the gap on its own.
 
@@ -52,10 +53,13 @@ model is at 0.960421 (just below 0.9605); the next model-variety round
 | members | C | OOF AUC | notes |
 |---|---|---|---|
 | `lgbm_raw` + `lgbm_full` | 0.2 | 0.960555 | 2-OOF stack |
-| `lgbm_raw` + `lgbm_full` + `lgbm_full_te` | **0.005** | **0.960685** | 3-OOF stack (current best) |
+| `lgbm_raw` + `lgbm_full` + `lgbm_full_te` | 0.005 | 0.960685 | 3-OOF stack |
+| all 4 (incl. `lgbm_full_d`) | **0.005** | **0.960739** | 4-OOF stack (current best) |
 
 The TE model is slightly worse on its own but adds diversity; the
-blend gains +0.000130 by including it.
+`lgbm_full_d` model is essentially tied with the champion (within
+noise) but adds yet another diverse member. Each new model is
+contributing +0.00005-0.00013 to the blend.
 
 ## Per-segment AUC at champion (`lgbm_full`)
 
@@ -118,15 +122,13 @@ predictor (3.5× the second-place).
 
 ## Next 3 ideas
 
-1. **exp_D_small**: small interaction features (log delays, rating
-   aggregates, Type×Class×Customer cross). The TE didn't add signal at
-   the 4-way level because the route features already capture much of
-   the same info. Small hand-engineered features might add NEW signal.
-2. **exp_E_xgb**: XGBoost on the route-enriched features. Adds a
+1. **exp_E_xgb**: XGBoost on the route-enriched features. Adds a
    non-LGBM member to the blend (highest-leverage single change for
    ensemble diversity). CPU-bound: ~3-5 min per fold.
-3. **exp_E_cat**: CatBoost on the route-enriched features. CPU is
+2. **exp_E_cat**: CatBoost on the route-enriched features. CPU is
    5-10× slower than LGBM; will run a depth-4 variant first.
+3. **exp_F_optuna**: Optuna search (≤40 trials) on the champion LGBM
+   hyperparameters. May find a +0.0001-0.0003 improvement.
 
 ## Open questions
 
