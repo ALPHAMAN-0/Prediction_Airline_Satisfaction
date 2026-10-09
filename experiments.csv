@@ -1,2 +1,3 @@
 exp_id,change,oof_auc,delta,per_fold_aucs,blend_auc,runtime_min,result,notes
 0_sanity,plain LGBM on raw features (sanity check),0.95881,0.0,"0.9589,0.9578,0.9595,0.9588,0.9592",0.0,1.32,CHAMPION,5-fold full data; expected ~0.9588; sets GATE=0.000064
+1_B_route,"Flight Distance group features (count, src counts, mean/std ratings+Age, cat shares)",0.9604214726686573,0.0016114726686572434,"0.9605,0.9595,0.9612,0.9605,0.9604",0.0,1.5905068039894104,NEW CHAMPION,per_fold_won=5/5 vs raw gate=0.000064

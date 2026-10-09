@@ -1,0 +1,62 @@
+feat,gain
+Online boarding,2071879.1874697208
+Inflight wifi service,590036.1978592873
+Type of Travel,481930.2299480438
+Class,294951.79962801933
+Inflight entertainment,240609.9165878296
+Customer Type,182734.14408922195
+Checkin service,102176.0806517601
+Baggage handling,82986.62404108047
+Ease of Online booking,80357.6465921402
+On-board service,79213.47262454033
+Seat comfort,77510.19305038452
+Cleanliness,46916.17094397545
+Age,43402.300110816956
+Leg room service,35562.872868299484
+Gate location,31803.890013694763
+Departure/Arrival time convenient,22186.074278354645
+Flight Distance,18447.634297847748
+route_Inflight wifi service_mean,10085.045187711716
+route_Online boarding_mean,9143.964893579483
+Food and drink,9019.956747293472
+route_Inflight wifi service_std,8908.54922747612
+route_Baggage handling_std,6451.985759019852
+route_Seat comfort_mean,6132.4752316474915
+Arrival Delay in Minutes,5890.718574523926
+route_Inflight entertainment_mean,5886.807784795761
+route_Checkin service_mean,5327.2852737903595
+route_share_Class_Eco Plus,5119.305277109146
+route_Online boarding_std,5111.382741212845
+route_share_Class_Business,4699.703060626984
+route_Gate location_mean,4299.378523111343
+route_Cleanliness_mean,4272.567279815674
+route_share_Customer Type_disloyal Customer,4215.150843143463
+route_Age_mean,4019.43661904335
+route_Food and drink_std,3889.608185529709
+route_Departure/Arrival time convenient_mean,3757.96915102005
+route_Gate location_std,3745.309268474579
+route_Age_std,3591.6281156539917
+route_Departure/Arrival time convenient_std,3568.31969666481
+route_Ease of Online booking_mean,3528.1669330596924
+route_Cleanliness_std,3527.693560361862
+route_Checkin service_std,3524.207832098007
+route_share_Type of Travel_Business travel,3518.20005774498
+route_Ease of Online booking_std,3328.810335636139
+route_Leg room service_std,3306.2721021175385
+route_On-board service_mean,3282.6959912776947
+route_Baggage handling_mean,3278.530942440033
+route_share_Customer Type_Loyal Customer,3254.991013288498
+route_share_Gender_Female,3254.922688484192
+route_count,3211.635125875473
+route_Food and drink_mean,3045.4121794700623
+route_Inflight entertainment_std,3023.148815870285
+route_On-board service_std,2971.8485174179077
+route_share_Class_Eco,2942.923887491226
+route_Leg room service_mean,2832.6349024772644
+route_Seat comfort_std,2638.2204456329346
+route_src0_count,2063.208606481552
+route_src1_count,1834.9783608913422
+route_share_Gender_Male,1568.67529296875
+Departure Delay in Minutes,1521.3555693626404
+Gender,1217.9939272403717
+route_share_Type of Travel_Personal Travel,710.665442943573

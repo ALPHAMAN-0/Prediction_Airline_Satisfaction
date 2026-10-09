@@ -189,3 +189,47 @@ def test_t6_blend_stack_smoke():
                 p = os.path.join(d, f"{nm}.npy")
                 if os.path.exists(p):
                     os.remove(p)
+
+
+# ----- T7: route-features aggregation is deterministic and label-free -----
+def test_t7_route_aggregates_deterministic_label_free():
+    """Build route aggregates from a tiny hand-made table; check
+    expected counts/means and that permuting y leaves them unchanged."""
+    df = pd.DataFrame({
+        "Flight Distance": [100, 100, 200, 200, 200, 300, 300, 300, 300],
+        "src":            [  0,   0,   1,   0,   1,   0,   0,   1,   1],
+        "Age":            [ 20,  30,  40,  50,  60,  25,  35,  45,  55],
+        "rating_x":       [  1,   2,   3,   4,   5,   2,   3,   4,   5],
+        "y":              [  0,   1,   0,   1,   0,   1,   0,   1,   0],
+    })
+    # import lazily to keep the test self-contained even if exp_B isn't built yet
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "exp_B_route", os.path.join(ROOT, "exp_B_route.py"))
+    if spec is None or spec.loader is None:
+        pytest.skip("exp_B_route.py not built yet")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except (FileNotFoundError, SyntaxError, ImportError) as e:
+        pytest.skip(f"exp_B_route.py not ready: {e}")
+    # build aggregates twice (different orderings / seeds) -> must be identical
+    agg_a = mod._route_aggregates(df, "Flight Distance", ["Age", "rating_x"])
+    perm = np.random.default_rng(7).permutation(len(df))
+    agg_b = mod._route_aggregates(df.iloc[perm].reset_index(drop=True),
+                                  "Flight Distance", ["Age", "rating_x"])
+    pd.testing.assert_frame_equal(
+        agg_a.sort_values("Flight Distance").reset_index(drop=True),
+        agg_b.sort_values("Flight Distance").reset_index(drop=True))
+    # exact means on a hand-computed table
+    means = agg_a.set_index("Flight Distance")[["route_Age_mean", "route_rating_x_mean"]]
+    np.testing.assert_allclose(means.loc[100, "route_Age_mean"], 25.0)
+    np.testing.assert_allclose(means.loc[200, "route_Age_mean"], 50.0)
+    np.testing.assert_allclose(means.loc[300, "route_Age_mean"], 40.0)
+    np.testing.assert_allclose(means.loc[100, "route_rating_x_mean"], 1.5)
+    np.testing.assert_allclose(means.loc[300, "route_rating_x_mean"], 3.5)
+    # counts
+    counts = agg_a.set_index("Flight Distance")["route_count"]
+    assert counts.loc[100] == 2
+    assert counts.loc[200] == 3
+    assert counts.loc[300] == 4

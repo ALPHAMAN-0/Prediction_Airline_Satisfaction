@@ -21,15 +21,19 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 - `folds.csv` — StratifiedKFold(5, shuffle=True, random_state=42), saved
   to disk. Never change after creation.
 - `harness.py` — single source of truth for IO, folds, OOF/test artifacts.
-- `_tests/test_harness.py` — 7 pytest tests, ~4 s on full data.
+- `_tests/test_harness.py` — 8 pytest tests, ~4 s on full data.
 - `experiments.csv` — append-only.
 
 ## Champion
 
-| round | champion | OOF AUC | blend AUC | GATE |
-|---|---|---|---|---|
-| 0 (sanity) | `lgbm_raw` (raw features only) | **0.958810** | — | **0.000064** |
-| 1 (B) | TBD | TBD | TBD | 0.000064 |
+| round | champion | OOF AUC | Δ vs prev | blend AUC | GATE |
+|---|---|---|---|---|---|
+| 0 (sanity) | `lgbm_raw` (raw features only) | 0.958810 | — | — | 0.000064 |
+| 1 (B) | `lgbm_full` (route features) | **0.960421** | **+0.001611** | — | 0.000064 |
+
+We're at **0.960421** — just below the 0.9605 goal but well into a
+plausible regime. The next round (C: target encoding) should push us
+above 0.9605.
 
 ## STEP 0 diagnostics
 
@@ -46,32 +50,77 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 
 (none yet — only 1 OOF; nested-CV stacker with 1 OOF is undefined)
 
+## Per-segment AUC at champion (`lgbm_full`)
+
+### 1D
+
+| segment | n | AUC |
+|---|---|---|
+| Type of Travel = Business | 497,441 | 0.9571 |
+| Type of Travel = Personal  | 202,194 | **0.8319** |
+| Class = Business           | 342,212 | 0.9402 |
+| Class = Eco                | 327,404 | 0.9043 |
+| Class = Eco Plus           |  30,019 | 0.9320 |
+| Customer Type = Loyal      | 576,990 | 0.9609 |
+| Customer Type = disloyal   | 122,645 | **0.9240** |
+| Age 50-85 (oldest)         | 161,837 | 0.9624 (strongest) |
+| Age 6-27 (youngest)        | 176,127 | 0.9409 |
+
+### 3D (Class × Type × Customer) — 5 weakest
+
+| Class | Type | Customer | n | AUC |
+|---|---|---|---|---|
+| Business | Personal | Loyal     | 3,939  | **0.8148** |
+| Eco      | Personal | Loyal     | 185,691 | 0.8323 |
+| Eco Plus | Personal | Loyal     | 12,459  | 0.8328 |
+| Eco Plus | Business | disloyal  | 2,574  | 0.8685 |
+| Eco      | Business | disloyal  | 76,070 | 0.8944 |
+
+**Insight**: "Personal Travel" is the single biggest weakness, regardless
+of class. Personal-Travel customers are 4x more likely to be unsatisfied
+but the model only achieves 0.83 AUC there. The weakest *large* segment
+is Eco × Personal × Loyal (n=185k, AUC=0.83).
+
+## Top 15 features by gain (`lgbm_full`)
+
+| feature | gain |
+|---|---|
+| Online boarding       | 2,071,879 |
+| Inflight wifi service | 590,036 |
+| Type of Travel        | 481,930 |
+| Class                 | 294,952 |
+| Inflight entertainment| 240,610 |
+| Customer Type         | 182,734 |
+| Checkin service       | 102,176 |
+| Baggage handling      | 82,987 |
+| Ease of Online booking| 80,358 |
+| On-board service      | 79,213 |
+| Seat comfort          | 77,510 |
+| Cleanliness           | 46,916 |
+| Age                   | 43,402 |
+| Leg room service      | 35,563 |
+| Gate location         | 31,804 |
+
+Note: route features did NOT make the top 15. They support the model but
+the raw ratings dominate. **Online boarding** is by far the strongest
+predictor (3.5× the second-place).
+
 ## Last 10 experiments
 
 (see `experiments.csv`)
 
-### Per-segment AUC at sanity baseline
-
-(0.9588 OOF — overall; per-segment analysis deferred until we have a
-non-trivial model)
-
-## Per-segment AUC (after a NEW CHAMPION)
-
-(populated when a new champion is found)
-
-## Top features by gain (after a NEW CHAMPION)
-
-(populated when a new champion is found)
-
 ## Next 3 ideas
 
-1. **exp_B_route**: Flight Distance group features (counts, per-source
-   counts, mean/std of ratings+Age, per-source category share). Computed
-   on train+test without labels. → `lgbm_full` candidate.
-2. **exp_C_te**: target encoding of Flight Distance + 4-way (Flight
+1. **exp_C_te**: Target encoding of Flight Distance + 4-way (Flight
    Distance × Class × Type of Travel × Customer Type) smoothed target.
-3. **exp_E_lgbm_xgb**: model variety — XGBoost with native categoricals
-   on the route-enriched features (gives the blend a non-LGBM member).
+   The 4-way interaction should directly target the 0.83-AUC
+   "Personal Travel" weakness. The weakest segment is Eco × Personal ×
+   Loyal; a smooth mean target for that key may give the model a
+   strong prior.
+2. **exp_D_small**: small interaction features (log delays, rating
+   aggregates, Type×Class×Customer cross).
+3. **exp_E_xgb**: XGBoost on the route-enriched features (adds a
+   non-LGBM member to the eventual blend).
 
 ## Open questions
 
