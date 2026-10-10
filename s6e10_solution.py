@@ -1111,7 +1111,8 @@ if RUN_XGB:
 
 # %%
 def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
-             loss="Logloss", od_type="Iter", od_wait=200):
+             loss="Logloss", od_type="Iter", od_wait=200, bagging_temp=None,
+             rsm=None, seed=SEED):
     if _have(name):
         oof = np.load(os.path.join(OUT_DIR, f"oof_{name}.npy"))
         tp  = np.load(os.path.join(OUT_DIR, f"test_{name}.npy"))
@@ -1146,7 +1147,11 @@ def _cat_fit(name, cat_features, depth, grow="Depthwise", iters=4000, lr=0.05,
         kw = dict(iterations=iters, learning_rate=lr, depth=depth,
                   grow_policy=grow, loss_function=loss, eval_metric=loss,
                   od_type=od_type, od_wait=od_wait,
-                  random_seed=SEED, verbose=False, allow_writing_files=False)
+                  random_seed=seed, verbose=False, allow_writing_files=False)
+        if bagging_temp is not None:
+            kw["bagging_temperature"] = bagging_temp
+        if rsm is not None:
+            kw["rsm"] = rsm
         if task_type == "GPU":
             kw.update(task_type="GPU", devices="0")
         else:
@@ -1179,6 +1184,8 @@ if RUN_CAT:
         _cat_fit("cat_depth4", CAT_COLS, depth=4, grow="Depthwise", iters=4000, lr=0.05)
     if os.environ.get("RUN_CAT_DIVERSE_3", "1") == "1":
         _cat_fit("cat_depth3", CAT_COLS, depth=3, grow="Depthwise", iters=4000, lr=0.05)
+    if os.environ.get("RUN_CAT_DIVERSE_5", "1") == "1":
+        _cat_fit("cat_depth5", CAT_COLS, depth=5, grow="Depthwise", iters=4000, lr=0.05)
     # Different grow policy at the best depth. Symmetric trees vs leaf-wise.
     if os.environ.get("RUN_CAT_DIVERSE_4", "1") == "1":
         _cat_fit("cat_depth4_lg", CAT_COLS, depth=4, grow="Lossguide", iters=4000, lr=0.05)
@@ -1232,6 +1239,64 @@ if RUN_RMLP:
         # should disable the rest of the RealMLP block, not crash the pipeline.
         print("RealMLP step failed:", e)
         RUN_RMLP = False
+
+# [New] Sklearn-MLP fallback. If pytabkit isn't available but RUN_RMLP=1, we
+# still want a neural-net model in the ensemble — it's the most diverse class.
+# sklearn's MLPClassifier is much slower than RealMLP but always available.
+# Use the original env var (env_RUN_RMLP) to gate this, since RUN_RMLP may
+# have been set to False after the RealMLP failure above.
+_RMLP_INTENT = bool(int(os.environ.get("RUN_RMLP", "1")))
+if (_RMLP_INTENT and not _have("realmlp_full")
+        and os.environ.get("RUN_SKMLP_FALLBACK", "1") == "1"):
+    try:
+        from sklearn.neural_network import MLPClassifier
+        from sklearn.preprocessing import StandardScaler
+        if not _have("skmlp_full"):
+            t0 = time.time()
+            oof = np.zeros(len(FULL_TR), dtype=np.float64)
+            tp  = np.zeros(len(FULL_TE), dtype=np.float64)
+            y = train_raw["__y__"].values
+            for k in range(N_FOLDS):
+                tr = FOLDS != k; va = FOLDS == k
+                # Standardise (MLP needs scaled inputs)
+                # Encode categoricals to integer codes so the MLP gets numeric input
+                Xtr_df = FULL_TR.iloc[tr].copy()
+                Xva_df = FULL_TR.iloc[va].copy()
+                Xte_df = FULL_TE.copy()
+                for c in CAT_COLS:
+                    if c in Xtr_df.columns:
+                        cats = pd.api.types.union_categoricals(
+                            [Xtr_df[c].astype("category"),
+                             Xva_df[c].astype("category"),
+                             Xte_df[c].astype("category")]).categories
+                        Xtr_df[c] = Xtr_df[c].astype(pd.CategoricalDtype(categories=cats)).cat.codes
+                        Xva_df[c] = Xva_df[c].astype(pd.CategoricalDtype(categories=cats)).cat.codes
+                        Xte_df[c] = Xte_df[c].astype(pd.CategoricalDtype(categories=cats)).cat.codes
+                Xtr = Xtr_df.values.astype("float32")
+                Xva = Xva_df.values.astype("float32")
+                Xte = Xte_df.values.astype("float32")
+                # Replace NaN with 0 (after standardisation this is the mean)
+                Xtr = np.nan_to_num(Xtr, nan=0.0, posinf=0.0, neginf=0.0)
+                Xva = np.nan_to_num(Xva, nan=0.0, posinf=0.0, neginf=0.0)
+                Xte = np.nan_to_num(Xte, nan=0.0, posinf=0.0, neginf=0.0)
+                sc = StandardScaler()
+                Xtr_s = sc.fit_transform(Xtr)
+                Xva_s = sc.transform(Xva)
+                Xte_s = sc.transform(Xte)
+                clf = MLPClassifier(hidden_layer_sizes=(256, 128),
+                                    activation="relu", solver="adam",
+                                    alpha=1e-4, batch_size=2048,
+                                    learning_rate_init=1e-3, max_iter=50,
+                                    early_stopping=True, validation_fraction=0.1,
+                                    random_state=SEED + k, verbose=False)
+                clf.fit(Xtr_s, y[tr])
+                oof[va] = clf.predict_proba(Xva_s)[:, 1]
+                tp += clf.predict_proba(Xte_s)[:, 1] / N_FOLDS
+                del clf; gc.collect()
+            minutes = (time.time() - t0) / 60.0
+            log_result("skmlp_full", oof, tp, minutes, N_FOLDS)
+    except (ImportError, RuntimeError, ValueError) as e:
+        print("sklearn MLP fallback failed:", e)
 
 # %% [markdown]
 # ## Step G — Ensemble (logistic stack, rank-avg, hill-climb)
@@ -1294,7 +1359,7 @@ TESTS = [t for _, _, t in ENTRIES]
 if len(OOFS) >= 2:
     # tune C
     best = None
-    for C in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2]:
+    for C in [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]:
         os_, ts_, w_ = _stack_lr(OOFS, TESTS, y, C=C, n_repeats=2)
         a = roc_auc_score(y, os_)
         print(f"stack C={C}  OOF AUC = {a:.6f}  weights = {dict(zip(NAMES, np.round(w_, 2)))}")

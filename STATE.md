@@ -32,11 +32,36 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 | 1 (B) | `lgbm_full` (route features) | **0.960421** | **+0.001611** | — | 0.000064 |
 | 2 (C) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960685 (blend) | 0.000064 |
 | 3 (D) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960739 (blend) | 0.000064 |
-| 4 (E1) | `lgbm_full` (still champion) | 0.960421 | 0 | **0.960741** (blend) | 0.000064 |
+| 4 (E1) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960741 (blend) | 0.000064 |
+| 5 (E1b) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960773 (blend) | 0.000064 |
+| 6 (E2)  | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960776 (blend) | 0.000064 |
+| 7 (F)   | `lgbm_full_optuna` (NEW CHAMPION) | 0.960686 | +0.000265 | 0.960837 (blend) | 0.000064 |
+| 8 (G)   | `lgbm_full_g` (NEW CHAMPION) | **0.960757** | **+0.000071** | **0.960865** (blend) | 0.000064 |
+| 9 (F2)  | `lgbm_full_g` (still champion) | 0.960757 | 0 | 0.960865 (blend) | 0.000064 |
+
+Round 8 (G): averaged 3 seeds (42/53/64) at the Optuna params
+(lr=0.020, num_leaves=138, l1=4.8, etc.) — 5/5 folds beat
+lgbm_full_optuna, OOF AUC **0.960757** (+0.000071). Best blend:
+5-OOF stack (`lgbm_full_g+cat_d4+lgbm_full+lgbm_full_te+lgbm_raw`)
+C=0.005 = **0.960865**. We're 0.000135 from the 0.9610 stretch goal.
+
+Round 7 (F): Optuna 30-trial 3-fold search picked `lr=0.020,
+num_leaves=138, min_data=68, feature_frac=0.75, bagging_frac=0.89,
+lambda_l1=4.8, lambda_l2=0.07, max_bin=127`. 5-fold refit: OOF AUC
+**0.960686**, +0.000265 vs old champion.
+
+Round 9 (F2): Optuna XGBoost (15 trials) found depth=6, lr=0.0114,
+sub=0.64, col=0.83 — 5-fold OOF AUC 0.960359, still didn't converge
+(best_iter=3999 max). REJECTED as a single model; not picked by the
+blend hill-climb (best blend stays at 0.960865). xgb_optuna is logged
+as a candidate but doesn't add to the stack.
 
 `xgb_full_d` is REJECTED (0.9559; XGB hit `best_iter=3999` max with
-lr=0.05; didn't converge). Including it in the stack HURT the blend
-(0.960739 → 0.960721), so the official `best.csv` is the 4-LGBM blend.
+lr=0.05; didn't converge). `xgb_d6_lr02` is REJECTED as a single model
+(0.960159) but a BLEND MEMBER. `cat_d4` is REJECTED as a single
+model (0.9595, hit best_iter=1999 max) but a tiny positive as a BLEND
+MEMBER. `submissions/best.csv` = 0.960837 blend; `submissions/best_single.csv`
+= 0.960686 champion. `xgb_full_d` is still excluded (HURT the stack).
 
 ## STEP 0 diagnostics
 
@@ -55,12 +80,20 @@ lr=0.05; didn't converge). Including it in the stack HURT the blend
 |---|---|---|---|
 | `lgbm_raw` + `lgbm_full` | 0.2 | 0.960555 | 2-OOF stack |
 | `lgbm_raw` + `lgbm_full` + `lgbm_full_te` | 0.005 | 0.960685 | 3-OOF stack |
-| all 4 (incl. `lgbm_full_d`) | **0.005** | **0.960739** | 4-OOF stack (current best) |
+| 4 LGBM (`raw`+`full`+`full_d`+`full_te`) | 0.005 | 0.960739 | 4-OOF stack |
+| 5 (incl. `xgb_d6_lr02`) | 0.005 | 0.960773 | 5-OOF stack |
+| 6 (incl. `cat_d4`)     | 0.005 | 0.960776 | 6-OOF stack |
+| 5 (optuna-anchor)     | 0.005 | 0.960837 | 5-OOF stack with F champion |
+| 5 (g-anchor)          | **0.005** | **0.960865** | 5-OOF stack with G champion (current best) |
 
 The TE model is slightly worse on its own but adds diversity; the
 `lgbm_full_d` model is essentially tied with the champion (within
-noise) but adds yet another diverse member. Each new model is
-contributing +0.00005-0.00013 to the blend.
+noise) but adds yet another diverse member. `xgb_d6_lr02` adds a
+non-LGBM perspective; `cat_d4` adds ordered-boosting diversity. Each
+new model is contributing +0.000003-0.00013 to the blend. The
+`xgb_full_d` (lr=0.05, depth=8, didn't converge) HURT the stack and
+is excluded. After G, the new champion `lgbm_full_g` (3-seed average of
+the Optuna params) anchors the stack.
 
 ## Per-segment AUC at champion (`lgbm_full`)
 
@@ -123,13 +156,12 @@ predictor (3.5× the second-place).
 
 ## Next 3 ideas
 
-1. **exp_E1b_xgb_lr0.02**: XGBoost with `lr=0.02` and `max_depth=6`
-   (longer training, more trees). The first XGB hit `best_iter=3999`
-   (max); it needs more iterations and shallower trees to converge.
-2. **exp_E2_cat**: CatBoost on the route-enriched features. CPU is
-   5-10× slower than LGBM; will run a depth-4 variant first.
-3. **exp_F_optuna**: Optuna search (≤40 trials) on the champion LGBM
-   hyperparameters. May find a +0.0001-0.0003 improvement.
+1. **exp_G2_5seeds**: extend G from 3 to 5 seeds (or 7) for further
+   variance reduction. May give +0.00002-0.00008.
+2. **exp_H_blend_rank**: hill-climbing on OOF rank averages may find
+   a different blend than the logit-stack.
+3. **exp_I_pseudo**: pseudo-labeling with confident test predictions
+   on the lgbm_full_g model.
 
 ## Open questions
 

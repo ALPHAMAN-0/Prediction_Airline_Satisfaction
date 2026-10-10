@@ -21,7 +21,10 @@ def assert_(name, cond, detail=""):
 # ----------------------------------------------------------------------
 print("\n--- T1: artifact presence & shape ---")
 expected = ["lgbm_raw", "lgbm_full", "lgbm_full_et", "xgb_full", "cat_depth10",
-            "stack", "rank", "hill", "meta"]
+            "stack", "rank", "hill", "meta",
+            "cat_depth4", "cat_depth6", "cat_depth3", "cat_depth5", "cat_depth4_lg",
+            "xgb_d3", "xgb_d4", "xgb_d6", "lgbm_shallow", "lgbm_full_bag",
+            "skmlp_full"]
 for name in expected:
     p_oof = f"{OUT}/oof_{name}.npy"
     p_test = f"{OUT}/test_{name}.npy"

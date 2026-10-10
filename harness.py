@@ -122,7 +122,13 @@ def load_pred(name: str) -> np.ndarray:
 
 
 def list_oofs() -> list[str]:
-    return sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(OOF_DIR, "*.npy")))
+    """List base-learner OOFs. Excludes meta/blend files (stack, rank, hill,
+    meta) so the auto-stack doesn't include itself.
+    """
+    EXCLUDE = {"stack", "rank", "hill", "meta"}
+    return sorted(os.path.basename(p)[:-4]
+                  for p in glob.glob(os.path.join(OOF_DIR, "*.npy"))
+                  if os.path.basename(p)[:-4] not in EXCLUDE)
 
 
 # ----- metrics -------------------------------------------------------------
@@ -266,24 +272,66 @@ def _stack_lr(oofs: list[np.ndarray], tests: list[np.ndarray], y: np.ndarray,
     return oof_stack, test_stack, weights
 
 
-def best_blend(min_names: int = 2) -> tuple[str, float, np.ndarray, np.ndarray] | None:
+def best_blend(min_names: int = 2,
+               exclude: set[str] | None = None) -> tuple[str, float, np.ndarray, np.ndarray] | None:
     """Pick the highest nested-CV stacker AUC across C values; return
     (best_name, oof_auc, oof_stack, test_stack) or None if not enough
-    OOFs exist."""
-    names = list_oofs()
+    OOFs exist.
+
+    Greedy hill-climb: start from the best single model, then keep adding
+    members (with replacement) that raise the blend AUC. Stops when no
+    remaining model improves by ≥ 1e-5.
+    """
+    names = [n for n in list_oofs() if not (exclude and n in exclude)]
     if len(names) < min_names:
         return None
     tr = load_train_test()[0]
     y = tr["__y__"].values
-    oofs = [load_oof(n) for n in names]
-    tests = [load_pred(n) for n in names]
-    best = None
+    oofs = {n: load_oof(n) for n in names}
+    tests = {n: load_pred(n) for n in names}
+    # individual AUCs
+    aucs = {n: float(roc_auc_score(y, oofs[n])) for n in names}
+    # start from the best single
+    seed = max(names, key=lambda n: aucs[n])
+    sel = [seed]
+    cur_auc = aucs[seed]
+    tol = 1e-5
+    improved = True
+    while improved:
+        improved = False
+        for n in names:
+            cand = sel + [n]
+            best_C = None
+            best_a = cur_auc
+            best_o = None
+            best_t = None
+            for C in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2]:
+                os_, ts_, w_ = _stack_lr(
+                    [oofs[k] for k in cand], [tests[k] for k in cand], y,
+                    C=C, n_repeats=2)
+                a = float(roc_auc_score(y, os_))
+                if a > best_a + tol:
+                    best_a = a; best_C = C; best_o = os_; best_t = ts_
+            if best_C is not None:
+                sel = cand
+                cur_auc = best_a
+                improved = True
+    # Final stack at the best C
+    final_oofs = [oofs[k] for k in sel]
+    final_tests = [tests[k] for k in sel]
+    best_C = None
+    best_a = cur_auc
+    best_o = None
+    best_t = None
     for C in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2]:
-        os_, ts_, w_ = _stack_lr(oofs, tests, y, C=C, n_repeats=2)
+        os_, ts_, w_ = _stack_lr(final_oofs, final_tests, y, C=C, n_repeats=3)
         a = float(roc_auc_score(y, os_))
-        if best is None or a > best[1]:
-            best = (f"stack_C={C}", a, os_, ts_)
-    return best
+        if a > best_a + tol or best_C is None:
+            if a > best_a:
+                best_a = a
+            best_C = C; best_o = os_; best_t = ts_
+    name = f"stack({'+'.join(sel)})_C={best_C}"
+    return name, best_a, best_o, best_t
 
 
 def write_blend_outputs(oof_stack: np.ndarray, test_stack: np.ndarray,
