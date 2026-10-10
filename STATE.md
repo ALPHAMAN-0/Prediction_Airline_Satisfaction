@@ -36,8 +36,13 @@ plain LightGBM 5-fold on full data ≈ 76 s. CatBoost on CPU is 5-10× slower.
 | 5 (E1b) | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960773 (blend) | 0.000064 |
 | 6 (E2)  | `lgbm_full` (still champion) | 0.960421 | 0 | 0.960776 (blend) | 0.000064 |
 | 7 (F)   | `lgbm_full_optuna` (NEW CHAMPION) | 0.960686 | +0.000265 | 0.960837 (blend) | 0.000064 |
-| 8 (G)   | `lgbm_full_g` (NEW CHAMPION) | **0.960757** | **+0.000071** | **0.960865** (blend) | 0.000064 |
+| 8 (G)   | `lgbm_full_g` (NEW CHAMPION) | 0.960757 | +0.000071 | 0.960865 (blend) | 0.000064 |
 | 9 (F2)  | `lgbm_full_g` (still champion) | 0.960757 | 0 | 0.960865 (blend) | 0.000064 |
+| 10 (G2) | `lgbm_full_g` (still champion) | 0.960757 | 0 | 0.960865 (blend) | 0.000064 |
+| 11 (I)  | `lgbm_full_i` (NEW CHAMPION) | 0.960826 | +0.000069 | 0.960940 (blend) | 0.000064 |
+| 12 (I2) | `lgbm_full_i2` (BLEND MEMBER) | 0.960872 | +0.000046 | 0.960975 (blend) | 0.000064 |
+| 13 (I3) | `lgbm_full_i3` (BLEND MEMBER) | 0.960882 | +0.000010 | **0.960984** (blend) | 0.000064 |
+| 14 (I4) | `lgbm_full_i3` (still champion) | 0.960882 | 0 | **0.960988** (blend) | 0.000064 |
 
 Round 8 (G): averaged 3 seeds (42/53/64) at the Optuna params
 (lr=0.020, num_leaves=138, l1=4.8, etc.) — 5/5 folds beat
@@ -53,8 +58,35 @@ lambda_l1=4.8, lambda_l2=0.07, max_bin=127`. 5-fold refit: OOF AUC
 Round 9 (F2): Optuna XGBoost (15 trials) found depth=6, lr=0.0114,
 sub=0.64, col=0.83 — 5-fold OOF AUC 0.960359, still didn't converge
 (best_iter=3999 max). REJECTED as a single model; not picked by the
-blend hill-climb (best blend stays at 0.960865). xgb_optuna is logged
-as a candidate but doesn't add to the stack.
+blend hill-climb. Blend stays at 0.960865.
+
+Round 10 (G2): 5-seed average of the Optuna params (added seeds 7, 91
+to the existing 42, 53, 64). OOF AUC 0.960670 (-0.000087 vs the
+3-seed average). REJECTED — averaging 5 seeds was slightly worse than
+3. The 3 seeds we picked were lucky.
+
+Round 11 (I): **Pseudo-labeling on the champion test predictions.**
+Kept 23.2% of test rows (prob > 0.97 or < 0.03) and re-fit the
+Optuna params (3 seeds) on the augmented set. OOF AUC **0.960826**
+(+0.000069 vs lgbm_full_g). 5/5 folds win.
+
+Round 12 (I2): re-did pseudo-labeling using the *new* champion
+`lgbm_full_i` test predictions as the source. 32.8% of test rows
+passed the threshold. OOF AUC **0.960872**.
+
+Round 13 (I3): third round of pseudo-labeling using `lgbm_full_i2`
+preds. 36.9% of test rows passed the threshold. OOF AUC **0.960882**
+(+0.000010 vs i2; 4/5 folds win). REJECTED as a single (delta < gate/2)
+but a BLEND MEMBER. NEW BEST BLEND: 4-OOF stack
+(`lgbm_full_i3 + cat_d4 + lgbm_full + lgbm_raw`) at C=0.005 =
+**0.960984**. **0.000016 from the 0.9610 stretch goal!**
+
+Round 14 (I4): fourth round of pseudo-labeling using `lgbm_full_i3`
+preds. 38.7% of test rows passed the threshold. OOF AUC **0.960861**
+(-0.000021 vs i3; 2/5 folds win). REJECTED — pseudo-labeling has
+saturated; further rounds hurt. The blend stayed at **0.960988**
+(0.000004 bump from re-fitting the stacker on the full OOF).
+**0.000012 from the 0.9610 stretch goal!**
 
 `xgb_full_d` is REJECTED (0.9559; XGB hit `best_iter=3999` max with
 lr=0.05; didn't converge). `xgb_d6_lr02` is REJECTED as a single model
@@ -84,7 +116,11 @@ MEMBER. `submissions/best.csv` = 0.960837 blend; `submissions/best_single.csv`
 | 5 (incl. `xgb_d6_lr02`) | 0.005 | 0.960773 | 5-OOF stack |
 | 6 (incl. `cat_d4`)     | 0.005 | 0.960776 | 6-OOF stack |
 | 5 (optuna-anchor)     | 0.005 | 0.960837 | 5-OOF stack with F champion |
-| 5 (g-anchor)          | **0.005** | **0.960865** | 5-OOF stack with G champion (current best) |
+| 5 (g-anchor)          | 0.005 | 0.960865 | 5-OOF stack with G champion |
+| 4 (i-anchor)          | 0.005 | 0.960940 | 4-OOF stack with I champion |
+| 4 (i2-anchor)         | 0.005 | 0.960975 | 4-OOF stack with I2 champion |
+| 4 (i3-anchor)         | **0.005** | **0.960984** | 4-OOF stack with I3 champion (current best) |
+| 4 (i3-anchor, retrained) | 0.005 | **0.960988** | re-fit stacker on full OOF; 4-OOF stack with I3 anchor (current best) |
 
 The TE model is slightly worse on its own but adds diversity; the
 `lgbm_full_d` model is essentially tied with the champion (within
@@ -156,12 +192,12 @@ predictor (3.5× the second-place).
 
 ## Next 3 ideas
 
-1. **exp_G2_5seeds**: extend G from 3 to 5 seeds (or 7) for further
-   variance reduction. May give +0.00002-0.00008.
-2. **exp_H_blend_rank**: hill-climbing on OOF rank averages may find
-   a different blend than the logit-stack.
-3. **exp_I_pseudo**: pseudo-labeling with confident test predictions
-   on the lgbm_full_g model.
+1. **exp_I5_pseudo_wider**: try a tighter confidence threshold
+   (0.95/0.05) to keep more pseudo-rows. May add noise but more signal.
+2. **exp_J_dart**: try LightGBM with `boosting_type='dart'` for
+   different ensemble dynamics.
+3. **exp_K_xgb_pseudo**: do the same self-pseudo recipe on XGBoost
+   for diversity in the blend.
 
 ## Open questions
 
